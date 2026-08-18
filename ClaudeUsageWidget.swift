@@ -1,0 +1,450 @@
+// Claude Usage Widget — small always-on-top floating panel showing
+// Claude Code usage limits (session / all models weekly / Fable weekly).
+// Reads the Claude Code OAuth token from the macOS Keychain (or
+// ~/.claude/.credentials.json) and polls the same usage endpoint that
+// claude.ai/settings/usage renders.
+//
+// Build:  swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift
+// Run:    ./ClaudeUsageWidget   (right-click the widget for Refresh / Quit)
+
+import AppKit
+
+// MARK: - Data
+
+struct Metric {
+    var pct: Double
+    var resetsAt: Date?
+}
+
+struct Usage {
+    var session: Metric?
+    var weekly: Metric?
+    var fable: Metric?
+    var fableLabel: String?
+}
+
+enum FetchError: Error {
+    case noToken
+    case http(Int)
+    case badResponse
+}
+
+// MARK: - Credentials
+
+func readCredentialsString() -> String? {
+    // 1) macOS Keychain (default storage on Mac)
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = Pipe()
+    if (try? p.run()) != nil {
+        p.waitUntilExit()
+        if p.terminationStatus == 0 {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let s = String(data: data, encoding: .utf8), !s.isEmpty {
+                return s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+    }
+    // 2) Plain-file fallback
+    let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/.credentials.json")
+    if let d = try? Data(contentsOf: url), let s = String(data: d, encoding: .utf8) {
+        return s
+    }
+    return nil
+}
+
+func accessToken() -> String? {
+    guard let raw = readCredentialsString(),
+          let data = raw.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    if let oauth = obj["claudeAiOauth"] as? [String: Any],
+       let tok = oauth["accessToken"] as? String { return tok }
+    if let tok = obj["accessToken"] as? String { return tok }
+    return nil
+}
+
+// MARK: - Fetch + parse
+
+func parseDate(_ any: Any?) -> Date? {
+    guard let s = any as? String else {
+        if let t = any as? Double { return Date(timeIntervalSince1970: t) }
+        return nil
+    }
+    let f1 = ISO8601DateFormatter()
+    f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f1.date(from: s) { return d }
+    let f2 = ISO8601DateFormatter()
+    f2.formatOptions = [.withInternetDateTime]
+    return f2.date(from: s)
+}
+
+func parseUsage(_ data: Data) -> Usage? {
+    guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+
+    func metric(_ any: Any?) -> Metric? {
+        guard let d = any as? [String: Any] else { return nil }
+        let raw = (d["utilization"] as? Double)
+            ?? (d["utilization"] as? Int).map(Double.init)
+            ?? (d["used_percent"] as? Double)
+        guard let v = raw else { return nil }
+        return Metric(pct: v, resetsAt: parseDate(d["resets_at"] ?? d["resetsAt"]))
+    }
+
+    var u = Usage()
+
+    // Primary source: the `limits` array (session / weekly_all / weekly_scoped).
+    if let limits = obj["limits"] as? [[String: Any]] {
+        for l in limits {
+            let raw = (l["percent"] as? Double) ?? (l["percent"] as? Int).map(Double.init)
+            guard let p = raw else { continue }
+            let m = Metric(pct: p, resetsAt: parseDate(l["resets_at"]))
+            switch l["kind"] as? String {
+            case "session": u.session = m
+            case "weekly_all": u.weekly = m
+            case "weekly_scoped":
+                u.fable = m
+                if let scope = l["scope"] as? [String: Any],
+                   let model = scope["model"] as? [String: Any],
+                   let name = model["display_name"] as? String {
+                    u.fableLabel = name
+                }
+            default: break
+            }
+        }
+    }
+
+    // Fallback: legacy top-level buckets.
+    if u.session == nil { u.session = metric(obj["five_hour"]) }
+    if u.weekly == nil { u.weekly = metric(obj["seven_day"]) }
+    if u.fable == nil {
+        for key in ["seven_day_fable", "seven_day_opus", "seven_day_sonnet"] {
+            if let m = metric(obj[key]) { u.fable = m; break }
+        }
+    }
+    guard u.session != nil || u.weekly != nil || u.fable != nil else { return nil }
+
+    // Normalize: if every value is a 0–1 fraction, scale to percent.
+    let vals = [u.session?.pct, u.weekly?.pct, u.fable?.pct].compactMap { $0 }
+    if let mx = vals.max(), mx <= 1.5 {
+        u.session?.pct *= 100
+        u.weekly?.pct *= 100
+        u.fable?.pct *= 100
+    }
+    return u
+}
+
+func fetchUsage(completion: @escaping (Result<Usage, Error>) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+        guard let token = accessToken() else {
+            DispatchQueue.main.async { completion(.failure(FetchError.noToken)) }
+            return
+        }
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.timeoutInterval = 15
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                if let err = err { completion(.failure(err)); return }
+                guard let http = resp as? HTTPURLResponse else {
+                    completion(.failure(FetchError.badResponse)); return
+                }
+                guard http.statusCode == 200 else {
+                    completion(.failure(FetchError.http(http.statusCode))); return
+                }
+                if let data = data, let usage = parseUsage(data) {
+                    completion(.success(usage))
+                } else {
+                    completion(.failure(FetchError.badResponse))
+                }
+            }
+        }.resume()
+    }
+}
+
+func fetchProfile(completion: @escaping (String?) -> Void) {
+    DispatchQueue.global(qos: .utility).async {
+        guard let token = accessToken() else {
+            DispatchQueue.main.async { completion(nil) }
+            return
+        }
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/profile")!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.timeoutInterval = 15
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            var result: String?
+            if let data = data,
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let account = obj["account"] as? [String: Any]
+                let name = (account?["full_name"] as? String)
+                    ?? (account?["display_name"] as? String)
+                    ?? (account?["email"] as? String)
+                let org = (obj["organization"] as? [String: Any])?["name"] as? String
+                switch (name, org) {
+                case let (n?, o?): result = "\(n) · \(o)"
+                case let (n?, nil): result = n
+                case let (nil, o?): result = o
+                default: result = nil
+                }
+            }
+            DispatchQueue.main.async { completion(result) }
+        }.resume()
+    }
+}
+
+// MARK: - Views
+
+final class PulsingDot: NSView {
+    private let dot = CALayer()
+    var color: NSColor = .tertiaryLabelColor { didSet { dot.backgroundColor = color.cgColor } }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        dot.frame = bounds
+        dot.cornerRadius = bounds.height / 2
+        dot.backgroundColor = color.cgColor
+        layer?.addSublayer(dot)
+        let anim = CABasicAnimation(keyPath: "opacity")
+        anim.fromValue = 1.0
+        anim.toValue = 0.2
+        anim.duration = 0.9
+        anim.autoreverses = true
+        anim.repeatCount = .infinity
+        dot.add(anim, forKey: "pulse")
+        toolTip = "Live — refreshes every minute"
+    }
+
+    required init?(coder: NSCoder) { fatalError("unused") }
+}
+
+final class BarView: NSView {
+    var value: Double = 0 { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds
+        let radius = r.height / 2
+        NSColor.labelColor.withAlphaComponent(0.13).setFill()
+        NSBezierPath(roundedRect: r, xRadius: radius, yRadius: radius).fill()
+
+        let v = min(max(value, 0), 100)
+        guard v > 0.5 else { return }
+        let w = max(r.height, r.width * CGFloat(v) / 100.0)
+        let fillRect = NSRect(x: 0, y: 0, width: w, height: r.height)
+        barColor(v).setFill()
+        NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
+    }
+
+    private func barColor(_ v: Double) -> NSColor {
+        if v >= 90 { return .systemRed }
+        if v >= 70 { return .systemOrange }
+        return NSColor(srgbRed: 0.31, green: 0.47, blue: 0.90, alpha: 1) // claude.ai blue
+    }
+}
+
+final class Row {
+    let name = NSTextField(labelWithString: "")
+    let bar = BarView()
+    let pct = NSTextField(labelWithString: "–")
+
+    init(title: String) {
+        name.stringValue = title
+        name.font = .systemFont(ofSize: 11)
+        name.textColor = .secondaryLabelColor
+        pct.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        pct.alignment = .right
+    }
+
+    func update(_ m: Metric?, resetPrefix: String) {
+        guard let m = m else {
+            pct.stringValue = "–"
+            bar.value = 0
+            bar.toolTip = nil
+            return
+        }
+        pct.stringValue = "\(Int(m.pct.rounded()))%"
+        bar.value = m.pct
+        if let d = m.resetsAt {
+            let f = DateFormatter()
+            f.dateFormat = "EEE h:mm a"
+            bar.toolTip = "\(resetPrefix) \(f.string(from: d))"
+            name.toolTip = bar.toolTip
+        }
+    }
+}
+
+// MARK: - App
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var panel: NSPanel!
+    let sessionRow = Row(title: "Session")
+    let weeklyRow = Row(title: "All models")
+    let fableRow = Row(title: "Fable")
+    let footer = NSTextField(labelWithString: "loading…")
+    let userLabel = NSTextField(labelWithString: " ")
+    let liveDot = PulsingDot(frame: NSRect(x: 0, y: 0, width: 7, height: 7))
+    var timer: Timer?
+    var sessionResetsAt: Date?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildPanel()
+        refresh()
+        fetchProfile { [weak self] label in
+            self?.userLabel.stringValue = label ?? ""
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
+        // Tick the "resets in Xh Ym" footer between fetches
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.updateFooter()
+        }
+    }
+
+    func buildPanel() {
+        let width: CGFloat = 260, height: CGFloat = 168
+        panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered, defer: false)
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.isMovableByWindowBackground = true
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hasShadow = true
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = true
+
+        let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        effect.material = .hudWindow
+        effect.state = .active
+        effect.blendingMode = .behindWindow
+        effect.wantsLayer = true
+        effect.layer?.cornerRadius = 12
+        effect.layer?.masksToBounds = true
+        panel.contentView = effect
+
+        let pad: CGFloat = 12
+        let title = NSTextField(labelWithString: "Claude usage")
+        title.font = .systemFont(ofSize: 11, weight: .semibold)
+        title.frame = NSRect(x: pad, y: height - 26, width: 150, height: 14)
+        effect.addSubview(title)
+
+        liveDot.frame = NSRect(x: width - pad - 34, y: height - 21.5, width: 7, height: 7)
+        effect.addSubview(liveDot)
+
+        let refreshBtn = NSButton(title: "↻", target: self, action: #selector(refreshClicked))
+        refreshBtn.isBordered = false
+        refreshBtn.font = .systemFont(ofSize: 12)
+        refreshBtn.frame = NSRect(x: width - pad - 18, y: height - 28, width: 18, height: 18)
+        effect.addSubview(refreshBtn)
+
+        userLabel.font = .systemFont(ofSize: 9)
+        userLabel.textColor = .secondaryLabelColor
+        userLabel.frame = NSRect(x: pad, y: height - 40, width: width - pad * 2, height: 12)
+        userLabel.lineBreakMode = .byTruncatingTail
+        effect.addSubview(userLabel)
+
+        func place(_ row: Row, y: CGFloat) {
+            row.name.frame = NSRect(x: pad, y: y, width: 66, height: 14)
+            row.bar.frame = NSRect(x: pad + 70, y: y + 3.5, width: width - pad * 2 - 70 - 38, height: 7)
+            row.pct.frame = NSRect(x: width - pad - 34, y: y, width: 34, height: 14)
+            effect.addSubview(row.name)
+            effect.addSubview(row.bar)
+            effect.addSubview(row.pct)
+        }
+
+        place(sessionRow, y: height - 64)
+
+        let weeklyHeader = NSTextField(labelWithString: "WEEKLY")
+        weeklyHeader.font = .systemFont(ofSize: 8.5, weight: .semibold)
+        weeklyHeader.textColor = .tertiaryLabelColor
+        weeklyHeader.frame = NSRect(x: pad, y: height - 86, width: 100, height: 11)
+        effect.addSubview(weeklyHeader)
+
+        place(weeklyRow, y: height - 104)
+        place(fableRow, y: height - 124)
+
+        footer.font = .systemFont(ofSize: 9)
+        footer.textColor = .tertiaryLabelColor
+        footer.frame = NSRect(x: pad, y: 7, width: width - pad * 2, height: 12)
+        footer.lineBreakMode = .byTruncatingTail
+        effect.addSubview(footer)
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Claude Usage Widget", action: #selector(quit), keyEquivalent: "q"))
+        menu.items.forEach { $0.target = self }
+        effect.menu = menu
+
+        // Restore last position, default to top-right corner
+        panel.setFrameAutosaveName("ClaudeUsageWidget")
+        if panel.frame.origin == .zero, let screen = NSScreen.main {
+            let vf = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: vf.maxX - width - 16, y: vf.maxY - height - 16))
+        }
+        panel.orderFrontRegardless()
+    }
+
+    @objc func refreshClicked() { refresh() }
+    @objc func quit() { NSApp.terminate(nil) }
+
+    func refresh() {
+        fetchUsage { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let usage):
+                self.sessionRow.update(usage.session, resetPrefix: "Resets")
+                self.weeklyRow.update(usage.weekly, resetPrefix: "Resets")
+                self.fableRow.update(usage.fable, resetPrefix: "Resets")
+                if let label = usage.fableLabel { self.fableRow.name.stringValue = label }
+                self.sessionResetsAt = usage.session?.resetsAt
+                self.liveDot.color = .systemGreen
+                self.updateFooter()
+            case .failure(let err):
+                self.sessionResetsAt = nil
+                self.liveDot.color = .systemRed
+                switch err {
+                case FetchError.noToken:
+                    self.footer.stringValue = "⚠︎ no token — sign in with `claude`"
+                case FetchError.http(let code) where code == 401 || code == 403:
+                    self.footer.stringValue = "⚠︎ token expired — open Claude Code to refresh"
+                case FetchError.http(let code):
+                    self.footer.stringValue = "⚠︎ HTTP \(code)"
+                default:
+                    self.footer.stringValue = "⚠︎ offline — retrying…"
+                }
+            }
+        }
+    }
+
+    func updateFooter() {
+        guard let d = sessionResetsAt else { return }
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        let now = f.string(from: Date())
+        let secs = Int(d.timeIntervalSinceNow)
+        if secs > 0 {
+            let h = secs / 3600, m = (secs % 3600) / 60
+            let rel = h > 0 ? "\(h) hr \(m) min" : "\(m) min"
+            footer.stringValue = "Session resets in \(rel) · updated \(now)"
+        } else {
+            footer.stringValue = "Session reset · updated \(now)"
+        }
+    }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
