@@ -46,7 +46,11 @@ project) that shows Claude Code usage limits. All application code lives in
 - Be conservative with API calls: the usage endpoint returns 429 when polled
   too often. Keep the single in-flight request guard, the post-attempt
   rescheduling, and the `Retry-After`/backoff handling in `refresh()` — never
-  reintroduce a fixed repeating poll timer or an unthrottled retry.
+  reintroduce a fixed repeating poll timer, an unthrottled retry, or a poll
+  interval shorter than `basePoll` (5 min).
+- Never surface errors as panel text. On failure keep the last fetched values on
+  screen and signal state only through the live dot's color and tooltip
+  (`setStatus`): yellow = retrying by itself, red = the user must act.
 
 ## Security constraints
 

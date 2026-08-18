@@ -34,9 +34,10 @@ Native Swift/AppKit, no dependencies.
 
 Reads your Claude Code OAuth token from the macOS Keychain (item
 `Claude Code-credentials`, falling back to `~/.claude/.credentials.json`) and
-polls `https://api.anthropic.com/api/oauth/usage` every minute. Your name and
-org come from `/api/oauth/profile`. The token never leaves your machine except
-to Anthropic's API.
+polls `https://api.anthropic.com/api/oauth/usage` every 5 minutes — slow on
+purpose, so the widget never trips the API's rate limit. Your name and org come
+from `/api/oauth/profile`. The token never leaves your machine except to
+Anthropic's API.
 
 ## Build & run
 
@@ -54,12 +55,12 @@ On first run, macOS asks to allow Keychain access — choose **Always Allow**.
 ## Usage
 
 - Drag anywhere; position is remembered. Visible on all Spaces, no Dock icon.
-- Pulsing dot: green = live, red = last fetch failed (footer shows why).
+- Pulsing dot: green = up to date, yellow = temporary hiccup (it retries on its
+  own), red = you need to sign in again. Hover it for the detail and the time of
+  the last update — the widget never covers the panel with error text, it just
+  keeps showing the last numbers it got.
 - ↻ or right-click → **Refresh now**; right-click → **Quit** to close.
 - Bars turn orange at 70% and red at 90%. Hover a row for the exact reset time.
-- If the API rate-limits the widget (HTTP 429) it waits out the cool-off the
-  server asks for and shows `rate limited — retrying in …`; refreshing by hand
-  won't send a request until that passes.
 
 ## Debugging
 

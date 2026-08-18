@@ -28,7 +28,7 @@ without restarting. The token is used only as a `Bearer` header to
 Both called with headers `Authorization: Bearer <token>` and
 `anthropic-beta: oauth-2025-04-20`, 15 s timeout.
 
-- `GET https://api.anthropic.com/api/oauth/usage` — polled every 60 s.
+- `GET https://api.anthropic.com/api/oauth/usage` — polled every 5 min.
   - **Primary parse**: the `limits` array. Each entry has `kind`, `percent`
     (0–100), `resets_at` (ISO 8601), and optional
     `scope.model.display_name`. Mapping: `session` → Session row,
@@ -62,8 +62,10 @@ Both called with headers `Authorization: Bearer <token>` and
 4. `WEEKLY` section header.
 5. **All models** row.
 6. Model-scoped row (labeled from the API, e.g. **Fable**).
-7. Footer: `Session resets in X hr Y min · updated H:MM PM` (re-rendered
-   every 30 s between polls; errors replace this text).
+7. Footer: `Session resets in X hr Y min · updated H:MM PM`, where "updated"
+   is the last *successful* fetch (re-rendered every 30 s between polls). It
+   never shows an error — before the first successful fetch it reads
+   `loading…`, or `no data yet` once an attempt has failed.
 8. **Start at login** mini checkbox.
 
 Each row: label (left), progress bar, integer percentage (right). Bar fill
@@ -73,31 +75,38 @@ and an empty bar.
 
 ## Live dot
 
-Pulses continuously (opacity 1.0 ↔ 0.2, 0.9 s autoreverse). Gray before the
-first poll, green after a successful poll, red after a failed one. Tooltip:
-"Live — refreshes every minute".
+Pulses continuously (opacity 1.0 ↔ 0.2, 0.9 s autoreverse). It is the only
+place a problem is surfaced — color plus tooltip, never panel text:
+- gray, "Waiting for data…" — before the first poll
+- green, "Live" — last poll succeeded
+- yellow — transient trouble, retrying by itself: "Paused — Claude asked to
+  slow down" (429) or "Can't reach Claude — retrying" (offline, 5xx,
+  unparseable body)
+- red — needs the user: "Not signed in — run `claude` to sign in" or
+  "Sign-in expired — open Claude Code"
+When data has been fetched at least once, the tooltip appends
+`· updated H:MM PM`.
 
 ## Polling and errors
 
+Polling is deliberately conservative: the figures move over hours and days,
+while the endpoint returns 429 if it is called too often.
 - Usage poll on launch, then rescheduled after every attempt (one-shot timer,
-  never a fixed repeating beat): 60 s after a success, longer after a failure.
+  never a fixed repeating beat): 5 min after a success, longer after a failure.
+  Every scheduled delay gets 0–15 % of extra jitter, so restarts and a second
+  instance never line up on the same second, and a cool-off is never cut short.
 - At most one usage request is in flight at a time. Manual refresh (↻ button or
-  right-click → Refresh now) skips the normal wait but is debounced to one
-  request per 5 s.
+  right-click → Refresh now) skips the remaining wait but is debounced to one
+  request per 30 s.
 - Rate limiting (HTTP 429): the retry delay is the server's `Retry-After`
-  header (seconds or HTTP date) clamped to 60 s – 15 min, falling back to the
-  backoff below when the header is absent. Until it elapses no request is sent,
-  including manual refreshes, and the footer counts down
-  `⚠︎ rate limited — retrying in X`.
-- Any other failure doubles the retry delay (60 s → 120 s → … capped at
-  15 min); a success resets it to 60 s.
-- Footer error states:
-  - no readable token → `⚠︎ no token — sign in with \`claude\``
-  - HTTP 401/403 → `⚠︎ token expired — open Claude Code to refresh`
-  - HTTP 429 → `⚠︎ rate limited — retrying in X`
-  - other HTTP status → `⚠︎ HTTP <code>`
-  - network failure → `⚠︎ offline — retrying…`
-- Errors never clear the last successfully displayed bar values.
+  header (seconds or HTTP date) clamped to 5–30 min, falling back to the backoff
+  below when the header is absent. Until it elapses no request is sent at all,
+  manual refreshes included.
+- Any other failure doubles the retry delay (5 → 10 → 20 → 30 min, capped); a
+  success resets it to 5 min.
+- Failures never write to the panel: bars, percentages and footer keep the last
+  successfully fetched values, and only the live dot's color and tooltip change
+  (see Live dot).
 
 ## Start at login
 

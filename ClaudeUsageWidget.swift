@@ -238,7 +238,7 @@ final class PulsingDot: NSView {
         anim.autoreverses = true
         anim.repeatCount = .infinity
         dot.add(anim, forKey: "pulse")
-        toolTip = "Live — refreshes every minute"
+        toolTip = "Waiting for data…"
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -348,15 +348,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let liveDot = PulsingDot(frame: NSRect(x: 0, y: 0, width: 7, height: 7))
     var timer: Timer?
     var sessionResetsAt: Date?
+    var lastSuccess: Date?
+    var sawFailure = false
 
     // Polling / rate-limit state. The endpoint answers 429 if it is hit too
-    // often, so the poll timer is rescheduled after every attempt instead of
-    // firing on a fixed 60 s beat: successes go back to `basePoll`, failures
-    // double the delay up to `maxPoll`, and a 429 honours Retry-After.
-    let basePoll: TimeInterval = 60
-    let maxPoll: TimeInterval = 15 * 60
-    let minFetchGap: TimeInterval = 5 // debounces the ↻ button
-    var pollInterval: TimeInterval = 60
+    // often, so polling is deliberately slow — the numbers move over hours and
+    // days — and the timer is rescheduled after every attempt instead of firing
+    // on a fixed beat: successes go back to `basePoll`, failures double the
+    // delay up to `maxPoll`, and a 429 honours Retry-After.
+    let basePoll: TimeInterval = 5 * 60
+    let maxPoll: TimeInterval = 30 * 60
+    let minFetchGap: TimeInterval = 30 // debounces the ↻ button
+    var pollInterval: TimeInterval = 5 * 60
     var nextFetchAllowed = Date.distantPast
     var rateLimitedUntil: Date?
     var lastFetchStarted: Date?
@@ -477,9 +480,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func scheduleNextPoll(after delay: TimeInterval) {
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: max(delay, 1), repeats: false) {
+        // Only ever later than asked, so a cool-off is never cut short, and two
+        // instances (or restarts) don't line up on the same second.
+        let jittered = max(delay, 1) * Double.random(in: 1.0...1.15)
+        timer = Timer.scheduledTimer(withTimeInterval: jittered, repeats: false) {
             [weak self] _ in self?.refresh()
         }
+    }
+
+    /// Problems are shown as a dot color + tooltip only; the panel keeps the
+    /// last numbers it managed to fetch.
+    func setStatus(_ color: NSColor, _ tip: String) {
+        liveDot.color = color
+        guard let last = lastSuccess else { liveDot.toolTip = tip; return }
+        let f = DateFormatter()
+        f.dateFormat = "h:mm a"
+        liveDot.toolTip = "\(tip) · updated \(f.string(from: last))"
     }
 
     /// Sends at most one request at a time, never before `nextFetchAllowed`,
@@ -493,7 +509,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 {
             // A 429 is a hard stop: not even a manual refresh may hit the API.
             scheduleNextPoll(after: until.timeIntervalSinceNow)
-            updateFooter()
             return
         }
         let wait = nextFetchAllowed.timeIntervalSinceNow
@@ -514,60 +529,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.fableRow.update(usage.fable, resetPrefix: "Resets")
                 if let label = usage.fableLabel { self.fableRow.name.stringValue = label }
                 self.sessionResetsAt = usage.session?.resetsAt
-                self.liveDot.color = .systemGreen
+                self.lastSuccess = Date()
                 self.pollInterval = self.basePoll
                 self.rateLimitedUntil = nil
+                self.setStatus(.systemGreen, "Live")
                 self.updateFooter()
             case .failure(let err):
-                self.sessionResetsAt = nil
-                self.liveDot.color = .systemRed
+                // Nothing is written into the panel on failure: the rows and
+                // footer keep the last known values and only the dot changes.
+                self.sawFailure = true
                 // Every failure at least doubles the delay; a 429 prefers the
                 // server's Retry-After when it sends one.
                 var retry = min(self.pollInterval * 2, self.maxPoll)
                 switch err {
                 case FetchError.noToken:
-                    self.footer.stringValue = "⚠︎ no token — sign in with `claude`"
+                    self.setStatus(.systemRed, "Not signed in — run `claude` to sign in")
+                case FetchError.http(let code) where code == 401 || code == 403:
+                    self.setStatus(.systemRed, "Sign-in expired — open Claude Code")
                 case FetchError.rateLimited(let after):
                     retry = min(max(after ?? retry, self.basePoll), self.maxPoll)
                     self.rateLimitedUntil = Date().addingTimeInterval(retry)
-                    self.updateFooter()
-                case FetchError.http(let code) where code == 401 || code == 403:
-                    self.footer.stringValue = "⚠︎ token expired — open Claude Code to refresh"
-                case FetchError.http(let code):
-                    self.footer.stringValue = "⚠︎ HTTP \(code)"
+                    self.setStatus(.systemYellow, "Paused — Claude asked to slow down")
                 default:
-                    self.footer.stringValue = "⚠︎ offline — retrying…"
+                    self.setStatus(.systemYellow, "Can't reach Claude — retrying")
                 }
                 self.pollInterval = retry
+                self.updateFooter()
             }
             self.nextFetchAllowed = Date().addingTimeInterval(self.pollInterval)
             self.scheduleNextPoll(after: self.pollInterval)
         }
     }
 
-    func waitText(_ secs: TimeInterval) -> String {
-        let s = Int(secs.rounded())
-        if s >= 90 { return "\(Int((Double(s) / 60).rounded())) min" }
-        return "\(max(s, 1)) s"
-    }
-
+    /// The footer only ever describes data, never an error. "updated" is the
+    /// time of the last successful fetch, so stale numbers are never passed off
+    /// as fresh ones.
     func updateFooter() {
-        if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 {
-            footer.stringValue =
-                "⚠︎ rate limited — retrying in \(waitText(until.timeIntervalSinceNow))"
+        guard let last = lastSuccess else {
+            if sawFailure { footer.stringValue = "no data yet" }
             return
         }
-        guard let d = sessionResetsAt else { return }
         let f = DateFormatter()
         f.dateFormat = "h:mm a"
-        let now = f.string(from: Date())
+        let stamp = "updated \(f.string(from: last))"
+        guard let d = sessionResetsAt else { footer.stringValue = stamp; return }
         let secs = Int(d.timeIntervalSinceNow)
         if secs > 0 {
             let h = secs / 3600, m = (secs % 3600) / 60
             let rel = h > 0 ? "\(h) hr \(m) min" : "\(m) min"
-            footer.stringValue = "Session resets in \(rel) · updated \(now)"
+            footer.stringValue = "Session resets in \(rel) · \(stamp)"
         } else {
-            footer.stringValue = "Session reset · updated \(now)"
+            footer.stringValue = "Session reset · \(stamp)"
         }
     }
 }
