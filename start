@@ -1,0 +1,44 @@
+#!/bin/sh
+# Build (only if needed), replace any running instance, and launch the widget.
+#
+#   ./start          build if stale, then run
+#   ./start --force  always rebuild
+#   ./start --stop   just stop a running widget
+
+set -eu
+
+cd "$(dirname "$0")"
+
+SRC=ClaudeUsageWidget.swift
+BIN=ClaudeUsageWidget
+
+stop() {
+  if pkill -x "$BIN" 2>/dev/null; then
+    echo "stopped running widget"
+    # give the old panel a moment to disappear before a new one appears
+    sleep 0.5
+  fi
+}
+
+force=0
+case "${1:-}" in
+  --stop|stop) stop; exit 0 ;;
+  --force|-f) force=1 ;;
+  "") ;;
+  *) echo "usage: $0 [--force|--stop]" >&2; exit 2 ;;
+esac
+
+if ! command -v swiftc >/dev/null 2>&1; then
+  echo "swiftc not found — run: xcode-select --install" >&2
+  exit 1
+fi
+
+if [ "$force" -eq 1 ] || [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
+  echo "building ${BIN}…"
+  swiftc -O -o "$BIN" "$SRC"
+fi
+
+stop
+
+"$PWD/$BIN" >/dev/null 2>&1 &
+echo "widget running (pid $!) — right-click it to quit, or ./start --stop"

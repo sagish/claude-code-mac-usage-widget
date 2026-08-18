@@ -12,15 +12,14 @@ Native Swift/AppKit, no dependencies.
 
 1. **Prereqs**: Xcode Command Line Tools (`xcode-select --install`) and a
    Claude Code sign-in (run `claude` once and log in, if you haven't).
-2. **Clone and build**:
+2. **Clone**:
    ```sh
    git clone git@github.com:empathycom/claude-usage-widget.git
    cd claude-usage-widget
-   swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift
    ```
-3. **Run it**:
+3. **Build and run**:
    ```sh
-   ./ClaudeUsageWidget &
+   ./start
    ```
    macOS will ask to allow Keychain access to your Claude Code credentials —
    click **Always Allow**. The widget appears in the top-right corner; drag it
@@ -41,9 +40,13 @@ to Anthropic's API.
 
 ## Build & run
 
+`./start` compiles the source when it changed, stops a widget that's already
+running, and launches a fresh one in the background:
+
 ```sh
-swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift
-./ClaudeUsageWidget &
+./start          # build if needed, then run
+./start --force  # always rebuild
+./start --stop   # stop the running widget
 ```
 
 On first run, macOS asks to allow Keychain access — choose **Always Allow**.
@@ -54,6 +57,9 @@ On first run, macOS asks to allow Keychain access — choose **Always Allow**.
 - Pulsing dot: green = live, red = last fetch failed (footer shows why).
 - ↻ or right-click → **Refresh now**; right-click → **Quit** to close.
 - Bars turn orange at 70% and red at 90%. Hover a row for the exact reset time.
+- If the API rate-limits the widget (HTTP 429) it waits out the cool-off the
+  server asks for and shows `rate limited — retrying in …`; refreshing by hand
+  won't send a request until that passes.
 
 ## Debugging
 

@@ -26,6 +26,7 @@ struct Usage {
 enum FetchError: Error {
     case noToken
     case http(Int)
+    case rateLimited(TimeInterval?) // 429, with the server's Retry-After if given
     case badResponse
 }
 
@@ -81,6 +82,19 @@ func parseDate(_ any: Any?) -> Date? {
     let f2 = ISO8601DateFormatter()
     f2.formatOptions = [.withInternetDateTime]
     return f2.date(from: s)
+}
+
+/// `Retry-After` is either a number of seconds or an HTTP date.
+func retryAfter(_ http: HTTPURLResponse) -> TimeInterval? {
+    guard let raw = http.value(forHTTPHeaderField: "Retry-After")?
+        .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+    if let secs = Double(raw) { return max(secs, 0) }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "GMT")
+    f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+    guard let date = f.date(from: raw) else { return nil }
+    return max(date.timeIntervalSinceNow, 0)
 }
 
 func parseUsage(_ data: Data) -> Usage? {
@@ -156,7 +170,12 @@ func fetchUsage(completion: @escaping (Result<Usage, Error>) -> Void) {
                     completion(.failure(FetchError.badResponse)); return
                 }
                 guard http.statusCode == 200 else {
-                    completion(.failure(FetchError.http(http.statusCode))); return
+                    if http.statusCode == 429 {
+                        completion(.failure(FetchError.rateLimited(retryAfter(http))))
+                    } else {
+                        completion(.failure(FetchError.http(http.statusCode)))
+                    }
+                    return
                 }
                 if let data = data, let usage = parseUsage(data) {
                     completion(.success(usage))
@@ -330,16 +349,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
     var sessionResetsAt: Date?
 
+    // Polling / rate-limit state. The endpoint answers 429 if it is hit too
+    // often, so the poll timer is rescheduled after every attempt instead of
+    // firing on a fixed 60 s beat: successes go back to `basePoll`, failures
+    // double the delay up to `maxPoll`, and a 429 honours Retry-After.
+    let basePoll: TimeInterval = 60
+    let maxPoll: TimeInterval = 15 * 60
+    let minFetchGap: TimeInterval = 5 // debounces the ↻ button
+    var pollInterval: TimeInterval = 60
+    var nextFetchAllowed = Date.distantPast
+    var rateLimitedUntil: Date?
+    var lastFetchStarted: Date?
+    var isFetching = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildPanel()
         refresh()
         fetchProfile { [weak self] label in
             self?.userLabel.stringValue = label ?? ""
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
-        // Tick the "resets in Xh Ym" footer between fetches
+        // Tick the "resets in Xh Ym" footer (and any cool-off countdown)
+        // between fetches
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.updateFooter()
         }
@@ -441,13 +471,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.orderFrontRegardless()
     }
 
-    @objc func refreshClicked() { refresh() }
+    @objc func refreshClicked() { refresh(manual: true) }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func loginToggled(_ sender: NSButton) { setStartAtLogin(sender.state == .on) }
 
-    func refresh() {
+    func scheduleNextPoll(after delay: TimeInterval) {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: max(delay, 1), repeats: false) {
+            [weak self] _ in self?.refresh()
+        }
+    }
+
+    /// Sends at most one request at a time, never before `nextFetchAllowed`,
+    /// and never at all while the server's 429 cool-off is still running.
+    func refresh(manual: Bool = false) {
+        if isFetching { return }
+        if let started = lastFetchStarted, -started.timeIntervalSinceNow < minFetchGap {
+            scheduleNextPoll(after: minFetchGap)
+            return
+        }
+        if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 {
+            // A 429 is a hard stop: not even a manual refresh may hit the API.
+            scheduleNextPoll(after: until.timeIntervalSinceNow)
+            updateFooter()
+            return
+        }
+        let wait = nextFetchAllowed.timeIntervalSinceNow
+        if wait > 0 && !manual {
+            scheduleNextPoll(after: wait)
+            return
+        }
+
+        isFetching = true
+        lastFetchStarted = Date()
         fetchUsage { [weak self] result in
             guard let self = self else { return }
+            self.isFetching = false
             switch result {
             case .success(let usage):
                 self.sessionRow.update(usage.session, resetPrefix: "Resets")
@@ -456,13 +515,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let label = usage.fableLabel { self.fableRow.name.stringValue = label }
                 self.sessionResetsAt = usage.session?.resetsAt
                 self.liveDot.color = .systemGreen
+                self.pollInterval = self.basePoll
+                self.rateLimitedUntil = nil
                 self.updateFooter()
             case .failure(let err):
                 self.sessionResetsAt = nil
                 self.liveDot.color = .systemRed
+                // Every failure at least doubles the delay; a 429 prefers the
+                // server's Retry-After when it sends one.
+                var retry = min(self.pollInterval * 2, self.maxPoll)
                 switch err {
                 case FetchError.noToken:
                     self.footer.stringValue = "⚠︎ no token — sign in with `claude`"
+                case FetchError.rateLimited(let after):
+                    retry = min(max(after ?? retry, self.basePoll), self.maxPoll)
+                    self.rateLimitedUntil = Date().addingTimeInterval(retry)
+                    self.updateFooter()
                 case FetchError.http(let code) where code == 401 || code == 403:
                     self.footer.stringValue = "⚠︎ token expired — open Claude Code to refresh"
                 case FetchError.http(let code):
@@ -470,11 +538,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 default:
                     self.footer.stringValue = "⚠︎ offline — retrying…"
                 }
+                self.pollInterval = retry
             }
+            self.nextFetchAllowed = Date().addingTimeInterval(self.pollInterval)
+            self.scheduleNextPoll(after: self.pollInterval)
         }
     }
 
+    func waitText(_ secs: TimeInterval) -> String {
+        let s = Int(secs.rounded())
+        if s >= 90 { return "\(Int((Double(s) / 60).rounded())) min" }
+        return "\(max(s, 1)) s"
+    }
+
     func updateFooter() {
+        if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 {
+            footer.stringValue =
+                "⚠︎ rate limited — retrying in \(waitText(until.timeIntervalSinceNow))"
+            return
+        }
         guard let d = sessionResetsAt else { return }
         let f = DateFormatter()
         f.dateFormat = "h:mm a"

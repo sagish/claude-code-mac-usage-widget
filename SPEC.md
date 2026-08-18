@@ -79,11 +79,22 @@ first poll, green after a successful poll, red after a failed one. Tooltip:
 
 ## Polling and errors
 
-- Usage poll every 60 s, plus on launch and on manual refresh (↻ button or
-  right-click → Refresh now).
+- Usage poll on launch, then rescheduled after every attempt (one-shot timer,
+  never a fixed repeating beat): 60 s after a success, longer after a failure.
+- At most one usage request is in flight at a time. Manual refresh (↻ button or
+  right-click → Refresh now) skips the normal wait but is debounced to one
+  request per 5 s.
+- Rate limiting (HTTP 429): the retry delay is the server's `Retry-After`
+  header (seconds or HTTP date) clamped to 60 s – 15 min, falling back to the
+  backoff below when the header is absent. Until it elapses no request is sent,
+  including manual refreshes, and the footer counts down
+  `⚠︎ rate limited — retrying in X`.
+- Any other failure doubles the retry delay (60 s → 120 s → … capped at
+  15 min); a success resets it to 60 s.
 - Footer error states:
   - no readable token → `⚠︎ no token — sign in with \`claude\``
   - HTTP 401/403 → `⚠︎ token expired — open Claude Code to refresh`
+  - HTTP 429 → `⚠︎ rate limited — retrying in X`
   - other HTTP status → `⚠︎ HTTP <code>`
   - network failure → `⚠︎ offline — retrying…`
 - Errors never clear the last successfully displayed bar values.

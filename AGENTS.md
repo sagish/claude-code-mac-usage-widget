@@ -10,11 +10,16 @@ project) that shows Claude Code usage limits. All application code lives in
 
 - Requires only Xcode Command Line Tools (`swiftc`). No package manager, no
   `Package.swift` — do not introduce one for small changes.
-- Build: `swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift`
-- Run: `./ClaudeUsageWidget &` (background it; it's a GUI app with no Dock
-  icon). Kill with `pkill -f ClaudeUsageWidget` before relaunching a rebuild,
-  otherwise two widgets stack on screen.
+- Build and run: `./start` — rebuilds only when `ClaudeUsageWidget.swift` is
+  newer than the binary, stops any running instance, then launches detached.
+  `./start --force` always rebuilds; `./start --stop` just stops it.
+- Underlying commands, if you need them directly:
+  `swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift` then
+  `./ClaudeUsageWidget &` (background it; it's a GUI app with no Dock icon).
+  Always stop the old instance first (`pkill -x ClaudeUsageWidget`), otherwise
+  two widgets stack on screen and double the API poll rate.
 - The compiled binary is gitignored — never commit it.
+- `CLAUDE.md` is a symlink to this file; edit `AGENTS.md` only.
 
 ## Testing and verification
 
@@ -38,6 +43,10 @@ project) that shows Claude Code usage limits. All application code lives in
 - Networking uses `URLSession` with completions dispatched to the main queue;
   parsing uses `JSONSerialization` with defensive optional casts (the API
   shape has changed before — prefer the `limits` array, keep legacy fallbacks).
+- Be conservative with API calls: the usage endpoint returns 429 when polled
+  too often. Keep the single in-flight request guard, the post-attempt
+  rescheduling, and the `Retry-After`/backoff handling in `refresh()` — never
+  reintroduce a fixed repeating poll timer or an unthrottled retry.
 
 ## Security constraints
 
