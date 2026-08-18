@@ -25,19 +25,11 @@ Native Swift/AppKit, no dependencies.
    macOS will ask to allow Keychain access to your Claude Code credentials —
    click **Always Allow**. The widget appears in the top-right corner; drag it
    wherever you like.
-4. **(Optional) Start at login**:
-   ```sh
-   cat > ~/Library/LaunchAgents/com.empathy.claude-usage-widget.plist <<EOF
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0"><dict>
-     <key>Label</key><string>com.empathy.claude-usage-widget</string>
-     <key>ProgramArguments</key><array><string>$PWD/ClaudeUsageWidget</string></array>
-     <key>RunAtLoad</key><true/>
-   </dict></plist>
-   EOF
-   launchctl load ~/Library/LaunchAgents/com.empathy.claude-usage-widget.plist
-   ```
+4. **(Optional) Start at login**: tick the **Start at login** checkbox at the
+   bottom of the widget. It writes a LaunchAgent
+   (`~/Library/LaunchAgents/com.empathy.claude-usage-widget.plist`) pointing at
+   the binary's current location; untick to remove it. Takes effect at next
+   login — don't move the binary afterwards, or re-tick the box if you do.
 
 ## How it works
 

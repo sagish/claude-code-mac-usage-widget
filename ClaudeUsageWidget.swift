@@ -280,6 +280,43 @@ final class Row {
     }
 }
 
+// MARK: - Start at login (LaunchAgent)
+
+let agentPlistURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/LaunchAgents/com.empathy.claude-usage-widget.plist")
+
+func executablePath() -> String {
+    let raw = CommandLine.arguments[0]
+    if raw.hasPrefix("/") { return raw }
+    return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(raw).standardizedFileURL.path
+}
+
+func setStartAtLogin(_ enabled: Bool) {
+    if enabled {
+        let plist: [String: Any] = [
+            "Label": "com.empathy.claude-usage-widget",
+            "ProgramArguments": [executablePath()],
+            "RunAtLoad": true,
+        ]
+        try? FileManager.default.createDirectory(
+            at: agentPlistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let data = try? PropertyListSerialization.data(
+            fromPropertyList: plist, format: .xml, options: 0) {
+            try? data.write(to: agentPlistURL)
+        }
+        // Not loaded via launchctl here — that would spawn a second instance.
+        // RunAtLoad picks it up at next login.
+    } else {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["unload", agentPlistURL.path]
+        try? p.run()
+        p.waitUntilExit()
+        try? FileManager.default.removeItem(at: agentPlistURL)
+    }
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -309,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func buildPanel() {
-        let width: CGFloat = 260, height: CGFloat = 168
+        let width: CGFloat = 260, height: CGFloat = 184
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: width, height: height),
             styleMask: [.borderless, .nonactivatingPanel],
@@ -375,9 +412,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         footer.font = .systemFont(ofSize: 9)
         footer.textColor = .tertiaryLabelColor
-        footer.frame = NSRect(x: pad, y: 7, width: width - pad * 2, height: 12)
+        footer.frame = NSRect(x: pad, y: 22, width: width - pad * 2, height: 12)
         footer.lineBreakMode = .byTruncatingTail
         effect.addSubview(footer)
+
+        let loginToggle = NSButton(checkboxWithTitle: "Start at login",
+                                   target: self, action: #selector(loginToggled(_:)))
+        loginToggle.controlSize = .mini
+        loginToggle.font = .systemFont(ofSize: 9)
+        loginToggle.frame = NSRect(x: pad - 2, y: 4, width: 120, height: 16)
+        loginToggle.state = FileManager.default.fileExists(atPath: agentPlistURL.path) ? .on : .off
+        loginToggle.toolTip = "Launch the widget automatically when you log in"
+        effect.addSubview(loginToggle)
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
@@ -397,6 +443,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshClicked() { refresh() }
     @objc func quit() { NSApp.terminate(nil) }
+    @objc func loginToggled(_ sender: NSButton) { setStartAtLogin(sender.state == .on) }
 
     func refresh() {
         fetchUsage { [weak self] result in
