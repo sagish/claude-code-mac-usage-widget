@@ -376,6 +376,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.updateFooter()
         }
+        // Timers don't tick while the Mac sleeps, and App Nap can defer a
+        // missed one-shot for a long time after wake, so the widget would sit
+        // on stale numbers. On wake, drop any failure backoff and poll again a
+        // few seconds later (giving the network time to come back). Going
+        // through refresh() keeps every guard — in-flight, 30 s debounce, and
+        // the 429 cool-off — intact.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.pollInterval = self.basePoll
+            self.nextFetchAllowed = Date.distantPast
+            self.scheduleNextPoll(after: 5)
+        }
     }
 
     func buildPanel() {

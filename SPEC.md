@@ -104,6 +104,10 @@ while the endpoint returns 429 if it is called too often.
   manual refreshes included.
 - Any other failure doubles the retry delay (5 → 10 → 20 → 30 min, capped); a
   success resets it to 5 min.
+- Wake from sleep: timers don't tick while the Mac sleeps, so on
+  `NSWorkspace.didWakeNotification` any failure backoff is reset to 5 min and a
+  poll is scheduled ~5 s later (letting the network come back up). The poll goes
+  through the normal guards — a 429 cool-off still blocks it.
 - Failures never write to the panel: bars, percentages and footer keep the last
   successfully fetched values, and only the live dot's color and tooltip change
   (see Live dot).
