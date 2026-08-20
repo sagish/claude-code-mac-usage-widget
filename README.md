@@ -61,6 +61,11 @@ On first run, macOS asks to allow Keychain access — choose **Always Allow**.
   keeps showing the last numbers it got.
 - ↻ or right-click → **Refresh now**; right-click → **Quit** to close.
 - Bars turn orange at 70% and red at 90%. Hover a row for the exact reset time.
+- Floater in the way? Tick **Menu bar** (bottom-right) to tuck the widget into
+  the menu bar: it shows your session and Fable percentages (`S 42% · F 9%`)
+  next to your other status icons, click it to drop the full panel down,
+  right-click for Refresh / move back / Quit. Untick (or right-click → **Move
+  back to floating widget**) to float again at the remembered spot.
 
 ## Debugging
 

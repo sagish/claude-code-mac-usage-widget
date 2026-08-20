@@ -351,6 +351,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lastSuccess: Date?
     var sawFailure = false
 
+    // Menu bar mode: the panel is hidden and a compact status item shows the
+    // highest utilization; clicking it drops the full panel down under it.
+    let inMenuBarKey = "InMenuBar"
+    var statusItem: NSStatusItem?
+    var menuBarToggle: NSButton!
+    var lastUsage: Usage?
+
     // Polling / rate-limit state. The endpoint answers 429 if it is hit too
     // often, so polling is deliberately slow — the numbers move over hours and
     // days — and the timer is rescheduled after every attempt instead of firing
@@ -472,6 +479,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loginToggle.toolTip = "Launch the widget automatically when you log in"
         effect.addSubview(loginToggle)
 
+        menuBarToggle = NSButton(checkboxWithTitle: "Menu bar",
+                                 target: self, action: #selector(menuBarToggled(_:)))
+        menuBarToggle.controlSize = .mini
+        menuBarToggle.font = .systemFont(ofSize: 9)
+        menuBarToggle.frame = NSRect(x: width - pad - 78, y: 4, width: 80, height: 16)
+        menuBarToggle.state = UserDefaults.standard.bool(forKey: inMenuBarKey) ? .on : .off
+        menuBarToggle.toolTip = "Tuck the widget into the menu bar instead of floating over windows"
+        effect.addSubview(menuBarToggle)
+
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
         menu.addItem(.separator())
@@ -485,7 +501,130 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let vf = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: vf.maxX - width - 16, y: vf.maxY - height - 16))
         }
+        if UserDefaults.standard.bool(forKey: inMenuBarKey) {
+            // Stop autosaving so the saved floating position survives menu bar
+            // mode; the panel stays hidden until the status item is clicked.
+            panel.setFrameAutosaveName("")
+            makeStatusItem()
+        } else {
+            panel.orderFrontRegardless()
+        }
+    }
+
+    // MARK: Menu bar mode
+
+    func setMenuBarMode(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: inMenuBarKey)
+        menuBarToggle.state = on ? .on : .off
+        if on {
+            // Disable autosave first so repositioning under the status item
+            // never overwrites the remembered floating position.
+            panel.setFrameAutosaveName("")
+            panel.orderOut(nil)
+            makeStatusItem()
+        } else {
+            removeStatusItem()
+            // Re-enabling autosave restores the saved floating frame.
+            panel.setFrameAutosaveName("ClaudeUsageWidget")
+            panel.orderFrontRegardless()
+        }
+    }
+
+    func makeStatusItem() {
+        guard statusItem == nil else { return }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let btn = item.button {
+            btn.image = NSImage(systemSymbolName: "sparkle", accessibilityDescription: "Claude usage")
+            btn.imagePosition = .imageLeading
+            btn.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            btn.target = self
+            btn.action = #selector(statusClicked)
+            btn.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        statusItem = item
+        updateStatusTitle()
+    }
+
+    func removeStatusItem() {
+        if let item = statusItem { NSStatusBar.system.removeStatusItem(item) }
+        statusItem = nil
+    }
+
+    @objc func statusClicked() {
+        guard let btn = statusItem?.button else { return }
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            let menu = NSMenu()
+            menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
+            menu.addItem(NSMenuItem(title: "Move back to floating widget", action: #selector(leaveMenuBar), keyEquivalent: ""))
+            menu.addItem(.separator())
+            menu.addItem(NSMenuItem(title: "Quit Claude Usage Widget", action: #selector(quit), keyEquivalent: "q"))
+            menu.items.forEach { $0.target = self }
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: btn.bounds.maxY + 4), in: btn)
+            return
+        }
+        togglePanelUnderStatusItem()
+    }
+
+    @objc func leaveMenuBar() { setMenuBarMode(false) }
+    @objc func menuBarToggled(_ sender: NSButton) { setMenuBarMode(sender.state == .on) }
+
+    func togglePanelUnderStatusItem() {
+        if panel.isVisible { panel.orderOut(nil); return }
+        if let win = statusItem?.button?.window {
+            let f = win.frame
+            var x = f.midX - panel.frame.width / 2
+            if let vf = win.screen?.visibleFrame {
+                x = min(max(x, vf.minX + 8), vf.maxX - panel.frame.width - 8)
+            }
+            panel.setFrameTopLeftPoint(NSPoint(x: x, y: f.minY - 6))
+        }
         panel.orderFrontRegardless()
+    }
+
+    /// Status item shows Session and the model-scoped weekly (e.g. Fable) as
+    /// `S 42% · F 9%` — each number tinted with its bar's warning colors; all
+    /// three metrics go in the tooltip.
+    func updateStatusTitle() {
+        guard let btn = statusItem?.button else { return }
+        guard lastUsage?.session != nil || lastUsage?.fable != nil else {
+            btn.title = "–"
+            btn.toolTip = "Claude usage — waiting for data"
+            return
+        }
+        let fableName = fableRow.name.stringValue
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        let title = NSMutableAttributedString()
+        let shown: [(String, Metric?)] = [
+            ("S", lastUsage?.session),
+            (String(fableName.prefix(1)), lastUsage?.fable),
+        ]
+        for (i, (tag, m)) in shown.enumerated() {
+            if i > 0 {
+                title.append(NSAttributedString(string: " · ", attributes: [
+                    .font: font, .foregroundColor: NSColor.tertiaryLabelColor,
+                ]))
+            }
+            title.append(NSAttributedString(string: "\(tag) ", attributes: [
+                .font: font, .foregroundColor: NSColor.secondaryLabelColor,
+            ]))
+            var attrs: [NSAttributedString.Key: Any] = [.font: font]
+            if let p = m?.pct {
+                if p >= 90 { attrs[.foregroundColor] = NSColor.systemRed }
+                else if p >= 70 { attrs[.foregroundColor] = NSColor.systemOrange }
+                title.append(NSAttributedString(string: "\(Int(p.rounded()))%", attributes: attrs))
+            } else {
+                title.append(NSAttributedString(string: "–", attributes: attrs))
+            }
+        }
+        btn.attributedTitle = title
+        let all: [(String, Metric?)] = [
+            ("Session", lastUsage?.session),
+            ("All models", lastUsage?.weekly),
+            (fableName, lastUsage?.fable),
+        ]
+        btn.toolTip = "Claude usage — " + all
+            .compactMap { name, m in m.map { "\(name) \(Int($0.pct.rounded()))%" } }
+            .joined(separator: " · ")
     }
 
     @objc func refreshClicked() { refresh(manual: true) }
@@ -542,6 +681,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.weeklyRow.update(usage.weekly, resetPrefix: "Resets")
                 self.fableRow.update(usage.fable, resetPrefix: "Resets")
                 if let label = usage.fableLabel { self.fableRow.name.stringValue = label }
+                self.lastUsage = usage
+                self.updateStatusTitle()
                 self.sessionResetsAt = usage.session?.resetsAt
                 self.lastSuccess = Date()
                 self.pollInterval = self.basePoll

@@ -53,6 +53,26 @@ Both called with headers `Authorization: Bearer <token>` and
   `ClaudeUsageWidget`. First launch defaults to the top-right corner of the
   main screen (16 pt inset).
 
+## Menu bar mode
+
+A **Menu bar** mini checkbox (bottom-right of the panel) tucks the widget
+into the menu bar so the floater doesn't cover other windows. State persists
+in `UserDefaults` key `InMenuBar` and is applied on launch.
+
+- **On**: the panel hides and an `NSStatusItem` appears — sparkle symbol +
+  `S <session>% · F <fable>%` (the "F" is the first letter of the
+  model-scoped row's label), monospaced digits, each percentage tinted
+  orange at ≥ 70 % and red at ≥ 90 %; a metric with no data shows "–", and
+  before any data arrives the whole title is "–". Tooltip lists all three
+  metrics.
+  - Left-click toggles the full panel, dropped down under the status item
+    (clamped to the screen edge). Everything in it keeps working, including
+    unticking the checkbox.
+  - Right-click: Refresh now · Move back to floating widget · Quit.
+- **Off**: the status item is removed and the panel reappears at its saved
+  floating position. Frame autosave is suspended while in menu bar mode so
+  drop-down positioning never overwrites the remembered floating frame.
+
 ## Layout (top to bottom)
 
 1. Title "Claude usage"; on the right, a pulsing live dot and a ↻ refresh
@@ -66,7 +86,8 @@ Both called with headers `Authorization: Bearer <token>` and
    is the last *successful* fetch (re-rendered every 30 s between polls). It
    never shows an error — before the first successful fetch it reads
    `loading…`, or `no data yet` once an attempt has failed.
-8. **Start at login** mini checkbox.
+8. **Start at login** mini checkbox (left) and **Menu bar** mini checkbox
+   (right, see Menu bar mode).
 
 Each row: label (left), progress bar, integer percentage (right). Bar fill
 color: blue below 70 %, orange at 70–89 %, red at ≥ 90 %. Rows with a known
