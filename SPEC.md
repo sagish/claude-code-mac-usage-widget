@@ -16,6 +16,10 @@ session, all-models weekly, and the model-scoped weekly limit (currently
 
 1. macOS Keychain generic password, service `Claude Code-credentials`, read
    via `/usr/bin/security find-generic-password -w`.
+   The `security` call has a 10 s deadline (terminate, then `SIGKILL`): the
+   first read — and any read while the Keychain is locked — puts up a macOS
+   prompt, and an unanswered prompt would otherwise block forever. On timeout
+   the read falls through to the file fallback.
 2. Fallback: `~/.claude/.credentials.json`.
 
 Either yields JSON containing `claudeAiOauth.accessToken`. The token is
@@ -129,6 +133,18 @@ while the endpoint returns 429 if it is called too often.
   `NSWorkspace.didWakeNotification` any failure backoff is reset to 5 min and a
   poll is scheduled ~5 s later (letting the network come back up). The poll goes
   through the normal guards — a 429 cool-off still blocks it.
+- Stuck-fetch rescue: the in-flight guard is released if a fetch has been in
+  flight for more than 2 min, so a request that never calls back can't wedge
+  polling permanently.
+- Watchdog: the 30 s footer timer also checks the schedule. If no fetch has even
+  been *attempted* for longer than `maxPoll` + 5 min and no 429 cool-off is
+  running, it calls `refresh()` to restart the chain. It is deliberately
+  generous — it can only recover a broken chain, never poll faster than the
+  normal schedule, and the call still passes through every guard.
+- App Nap: the app holds a `beginActivity(.userInitiated)` assertion for its
+  whole lifetime. As an accessory app that often has no visible window (menu bar
+  mode), it would otherwise be napped and have its one-shot timers deferred by
+  many minutes. Timers also carry a small tolerance, which only ever delays them.
 - Failures never write to the panel: bars, percentages and footer keep the last
   successfully fetched values, and only the live dot's color and tooltip change
   (see Live dot).

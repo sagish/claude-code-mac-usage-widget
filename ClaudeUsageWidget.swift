@@ -32,6 +32,12 @@ enum FetchError: Error {
 
 // MARK: - Credentials
 
+/// How long to wait for `security` before giving up on the Keychain. The
+/// first read (and any read while the Keychain is locked) puts up a macOS
+/// prompt; if nobody is there to answer it the process would otherwise block
+/// forever and wedge the whole poll chain.
+private let keychainTimeout: TimeInterval = 10
+
 func readCredentialsString() -> String? {
     // 1) macOS Keychain (default storage on Mac)
     let p = Process()
@@ -41,8 +47,17 @@ func readCredentialsString() -> String? {
     p.standardOutput = pipe
     p.standardError = Pipe()
     if (try? p.run()) != nil {
-        p.waitUntilExit()
-        if p.terminationStatus == 0 {
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+        if done.wait(timeout: .now() + keychainTimeout) == .timedOut {
+            // Blocked on an unanswered prompt: kill it and fall through to the
+            // file fallback rather than hanging the fetch forever.
+            p.terminate()
+            if done.wait(timeout: .now() + 2) == .timedOut {
+                kill(p.processIdentifier, SIGKILL)
+                _ = done.wait(timeout: .now() + 2)
+            }
+        } else if p.terminationStatus == 0 {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             if let s = String(data: data, encoding: .utf8), !s.isEmpty {
                 return s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -371,8 +386,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var rateLimitedUntil: Date?
     var lastFetchStarted: Date?
     var isFetching = false
+    /// A fetch still "in flight" after this long is assumed dead (a wedged
+    /// helper process, a socket that never completed) and the guard is
+    /// released so polling can resume.
+    let stuckFetchTimeout: TimeInterval = 2 * 60
+    /// Keeps App Nap from deferring the one-shot poll timers; held for the
+    /// app's lifetime.
+    var activityToken: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Accessory apps with no visible window are prime App Nap candidates,
+        // and a napped process can have its timers deferred for many minutes.
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated], reason: "usage polling")
         buildPanel()
         refresh()
         fetchProfile { [weak self] label in
@@ -380,9 +406,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Tick the "resets in Xh Ym" footer (and any cool-off countdown)
         // between fetches
-        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        // …and double as a watchdog: scheduling is a chain (each attempt
+        // schedules the next), so a single broken link would otherwise stop
+        // polling until the app is restarted.
+        let footerTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) {
+            [weak self] _ in
             self?.updateFooter()
+            self?.watchdogTick()
         }
+        footerTimer.tolerance = 5
         // Timers don't tick while the Mac sleeps, and App Nap can defer a
         // missed one-shot for a long time after wake, so the widget would sit
         // on stale numbers. On wake, drop any failure backoff and poll again a
@@ -636,9 +668,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Only ever later than asked, so a cool-off is never cut short, and two
         // instances (or restarts) don't line up on the same second.
         let jittered = max(delay, 1) * Double.random(in: 1.0...1.15)
-        timer = Timer.scheduledTimer(withTimeInterval: jittered, repeats: false) {
+        let t = Timer.scheduledTimer(withTimeInterval: jittered, repeats: false) {
             [weak self] _ in self?.refresh()
         }
+        // Harmless slack: the delay is already jittered and only ever grows.
+        t.tolerance = min(jittered * 0.1, 30)
+        timer = t
+    }
+
+    /// Last-resort recovery. If no fetch has even been *attempted* for far
+    /// longer than the slowest normal poll, the timer chain is broken (a
+    /// dropped one-shot, a deferred timer, a fetch that never called back), so
+    /// restart it. Deliberately generous — this must never poll faster than
+    /// the normal schedule, and refresh() still applies every guard.
+    func watchdogTick() {
+        if isFetching, let started = lastFetchStarted,
+           -started.timeIntervalSinceNow > stuckFetchTimeout {
+            // Presumed dead; release the guard so the chain can move again.
+            isFetching = false
+        }
+        if isFetching { return }
+        if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 { return }
+        let idle = lastFetchStarted.map { -$0.timeIntervalSinceNow } ?? .greatestFiniteMagnitude
+        if idle > maxPoll + 5 * 60 { refresh() }
     }
 
     /// Problems are shown as a dot color + tooltip only; the panel keeps the
@@ -654,7 +706,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Sends at most one request at a time, never before `nextFetchAllowed`,
     /// and never at all while the server's 429 cool-off is still running.
     func refresh(manual: Bool = false) {
-        if isFetching { return }
+        if isFetching {
+            // A fetch that has been "in flight" for minutes never called back
+            // (e.g. a Keychain read that blocked on an unanswered prompt).
+            // Drop the guard so this attempt can proceed; otherwise the
+            // in-flight one will reschedule when it completes.
+            guard let started = lastFetchStarted,
+                  -started.timeIntervalSinceNow > stuckFetchTimeout else { return }
+            isFetching = false
+        }
         if let started = lastFetchStarted, -started.timeIntervalSinceNow < minFetchGap {
             scheduleNextPoll(after: minFetchGap)
             return
