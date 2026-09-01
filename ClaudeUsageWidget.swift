@@ -2,7 +2,10 @@
 // Claude Code usage limits (session / all models weekly / Fable weekly).
 // Reads the Claude Code OAuth token from the macOS Keychain (or
 // ~/.claude/.credentials.json) and polls the same usage endpoint that
-// claude.ai/settings/usage renders.
+// claude.ai/settings/usage renders. When the access token has expired it
+// renews it itself with Claude Code's own OAuth refresh grant and writes the
+// rotated credentials back, so the widget stays live even when Claude Code
+// hasn't been opened in a while.
 //
 // Build:  swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift
 // Run:    ./ClaudeUsageWidget   (right-click the widget for Refresh / Quit)
@@ -38,11 +41,38 @@ enum FetchError: Error {
 /// forever and wedge the whole poll chain.
 private let keychainTimeout: TimeInterval = 10
 
-func readCredentialsString() -> String? {
+/// Where the credentials JSON was found. Rotated tokens are written back to
+/// the same store, never to the other one.
+enum CredentialSource { case keychain, file }
+
+private let keychainService = "Claude Code-credentials"
+private let credentialsFileURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".claude/.credentials.json")
+
+/// The decoded credentials JSON with every key preserved, so a token refresh
+/// can write the whole object back without dropping fields it doesn't know
+/// about (scopes, subscriptionType, rateLimitTier, …).
+struct Credentials {
+    var root: [String: Any]
+    var source: CredentialSource
+    /// Current Claude Code format nests the OAuth fields under
+    /// `claudeAiOauth`; the legacy format kept them at the top level.
+    var nested: Bool
+
+    var oauth: [String: Any]? {
+        nested ? root["claudeAiOauth"] as? [String: Any] : root
+    }
+    var accessToken: String? { oauth?["accessToken"] as? String }
+    var refreshToken: String? { oauth?["refreshToken"] as? String }
+    /// Milliseconds since the epoch, as Claude Code stores it.
+    var expiresAtMs: Double? { (oauth?["expiresAt"] as? NSNumber)?.doubleValue }
+}
+
+func readCredentialsString() -> (raw: String, source: CredentialSource)? {
     // 1) macOS Keychain (default storage on Mac)
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    p.arguments = ["find-generic-password", "-s", keychainService, "-w"]
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = Pipe()
@@ -60,28 +90,151 @@ func readCredentialsString() -> String? {
         } else if p.terminationStatus == 0 {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             if let s = String(data: data, encoding: .utf8), !s.isEmpty {
-                return s.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (s.trimmingCharacters(in: .whitespacesAndNewlines), .keychain)
             }
         }
     }
     // 2) Plain-file fallback
-    let url = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude/.credentials.json")
-    if let d = try? Data(contentsOf: url), let s = String(data: d, encoding: .utf8) {
-        return s
+    if let d = try? Data(contentsOf: credentialsFileURL),
+       let s = String(data: d, encoding: .utf8) {
+        return (s, .file)
     }
     return nil
 }
 
-func accessToken() -> String? {
-    guard let raw = readCredentialsString(),
+func readCredentials() -> Credentials? {
+    guard let (raw, source) = readCredentialsString(),
           let data = raw.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return nil }
-    if let oauth = obj["claudeAiOauth"] as? [String: Any],
-       let tok = oauth["accessToken"] as? String { return tok }
-    if let tok = obj["accessToken"] as? String { return tok }
+    if obj["claudeAiOauth"] as? [String: Any] != nil {
+        return Credentials(root: obj, source: source, nested: true)
+    }
+    if obj["accessToken"] as? String != nil {
+        return Credentials(root: obj, source: source, nested: false)
+    }
     return nil
+}
+
+func accessToken() -> String? { readCredentials()?.accessToken }
+
+// MARK: - Token refresh
+
+/// Claude Code's own public OAuth client and token endpoint — the pair that
+/// issued the stored tokens. The refresh grant only ever carries the refresh
+/// token here; both tokens stay out of logs, argv, and the UI.
+private let oauthTokenURL = URL(string: "https://console.anthropic.com/v1/oauth/token")!
+private let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+/// Refresh the access token this long before `expiresAt` so a token that
+/// lapses mid-poll doesn't cost a wasted usage request.
+private let refreshExpiryBuffer: TimeInterval = 60
+
+/// Attempts are gated so a dead refresh token (revoked, signed out) can never
+/// turn the poll loop into a hammer on the token endpoint. Only touched from
+/// the single-flight fetch path, so no extra synchronization is needed.
+private var lastRefreshAttempt: Date?
+private let refreshAttemptGap: TimeInterval = 60
+
+func credentialsNeedRefresh(_ c: Credentials) -> Bool {
+    guard let ms = c.expiresAtMs else { return false }
+    return Date().timeIntervalSince1970 >= ms / 1000 - refreshExpiryBuffer
+}
+
+/// Exchanges the stored refresh token for a fresh access token, persists the
+/// result back to the store it came from, and returns the updated
+/// credentials. Synchronous — call it only from the background fetch queue.
+/// Returns nil on any failure; callers then proceed with the stale token and
+/// the normal error path (red dot) reports the outcome.
+func refreshCredentials(_ creds: Credentials) -> Credentials? {
+    if let last = lastRefreshAttempt, -last.timeIntervalSinceNow < refreshAttemptGap {
+        return nil
+    }
+    guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else { return nil }
+    lastRefreshAttempt = Date()
+
+    var req = URLRequest(url: oauthTokenURL)
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.timeoutInterval = 15
+    req.httpBody = try? JSONSerialization.data(withJSONObject: [
+        "grant_type": "refresh_token",
+        "refresh_token": refreshToken,
+        "client_id": oauthClientID,
+    ])
+
+    var newAccess: String?
+    var newRefresh: String?
+    var expiresIn: Double?
+    let done = DispatchSemaphore(value: 0)
+    URLSession.shared.dataTask(with: req) { data, resp, _ in
+        defer { done.signal() }
+        guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+              let data = data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        newAccess = obj["access_token"] as? String
+        newRefresh = obj["refresh_token"] as? String
+        expiresIn = (obj["expires_in"] as? NSNumber)?.doubleValue
+    }.resume()
+    _ = done.wait(timeout: .now() + 20)
+
+    guard let access = newAccess, !access.isEmpty else { return nil }
+
+    var updated = creds
+    var oauth = updated.oauth ?? [:]
+    oauth["accessToken"] = access
+    // The endpoint rotates refresh tokens; keep the old one only when the
+    // response omits a new one.
+    if let r = newRefresh, !r.isEmpty { oauth["refreshToken"] = r }
+    if let s = expiresIn {
+        oauth["expiresAt"] = Int((Date().timeIntervalSince1970 + s) * 1000)
+    }
+    if updated.nested { updated.root["claudeAiOauth"] = oauth } else { updated.root = oauth }
+    persistCredentials(updated)
+    return updated
+}
+
+/// Writes rotated credentials back to the same store they were read from. A
+/// refresh can invalidate the previous refresh token, so skipping this write
+/// would silently sign Claude Code out.
+func persistCredentials(_ creds: Credentials) {
+    guard let data = try? JSONSerialization.data(
+        withJSONObject: creds.root, options: [.sortedKeys, .withoutEscapingSlashes]),
+        let json = String(data: data, encoding: .utf8) else { return }
+    switch creds.source {
+    case .file:
+        try? data.write(to: credentialsFileURL, options: .atomic)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: credentialsFileURL.path)
+    case .keychain:
+        // `security -i` reads its command from stdin, so the token JSON never
+        // appears in the process argument list (visible to `ps`). Escapes
+        // cover the JSON's own quotes; token payloads are base64url.
+        let escaped = json
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let cmd = "add-generic-password -U -a \"\(NSUserName())\" "
+            + "-s \"\(keychainService)\" -w \"\(escaped)\"\n"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["-i"]
+        let inPipe = Pipe()
+        p.standardInput = inPipe
+        p.standardOutput = Pipe()
+        p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return }
+        if let d = cmd.data(using: .utf8) {
+            inPipe.fileHandleForWriting.write(d)
+        }
+        inPipe.fileHandleForWriting.closeFile()
+        // Same bounded wait as the keychain read: never hang the poll chain.
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+        if done.wait(timeout: .now() + keychainTimeout) == .timedOut {
+            p.terminate()
+        }
+    }
 }
 
 // MARK: - Fetch + parse
@@ -168,37 +321,69 @@ func parseUsage(_ data: Data) -> Usage? {
     return u
 }
 
+/// One GET of the usage endpoint. Completes on the main queue.
+func requestUsage(token: String, completion: @escaping (Result<Usage, Error>) -> Void) {
+    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+    req.timeoutInterval = 15
+    URLSession.shared.dataTask(with: req) { data, resp, err in
+        DispatchQueue.main.async {
+            if let err = err { completion(.failure(err)); return }
+            guard let http = resp as? HTTPURLResponse else {
+                completion(.failure(FetchError.badResponse)); return
+            }
+            guard http.statusCode == 200 else {
+                if http.statusCode == 429 {
+                    completion(.failure(FetchError.rateLimited(retryAfter(http))))
+                } else {
+                    completion(.failure(FetchError.http(http.statusCode)))
+                }
+                return
+            }
+            if let data = data, let usage = parseUsage(data) {
+                completion(.success(usage))
+            } else {
+                completion(.failure(FetchError.badResponse))
+            }
+        }
+    }.resume()
+}
+
 func fetchUsage(completion: @escaping (Result<Usage, Error>) -> Void) {
     DispatchQueue.global(qos: .utility).async {
-        guard let token = accessToken() else {
+        guard let stored = readCredentials(), let storedToken = stored.accessToken else {
             DispatchQueue.main.async { completion(.failure(FetchError.noToken)) }
             return
         }
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.timeoutInterval = 15
-        URLSession.shared.dataTask(with: req) { data, resp, err in
-            DispatchQueue.main.async {
-                if let err = err { completion(.failure(err)); return }
-                guard let http = resp as? HTTPURLResponse else {
-                    completion(.failure(FetchError.badResponse)); return
-                }
-                guard http.statusCode == 200 else {
-                    if http.statusCode == 429 {
-                        completion(.failure(FetchError.rateLimited(retryAfter(http))))
-                    } else {
-                        completion(.failure(FetchError.http(http.statusCode)))
+        var creds = stored
+        var token = storedToken
+        // Proactive refresh: renew ahead of `expiresAt` so most polls never
+        // see a 401 at all. A failed refresh is not fatal here — the request
+        // below still runs with the stored token and reports as usual.
+        if credentialsNeedRefresh(creds),
+           let fresh = refreshCredentials(creds), let t = fresh.accessToken {
+            creds = fresh
+            token = t
+        }
+        requestUsage(token: token) { result in
+            // Reactive retry, once: a 401/403 despite a plausible `expiresAt`
+            // means the token went stale some other way. `refreshCredentials`
+            // rate-gates itself, so this cannot loop.
+            if case .failure(let err) = result, let fe = err as? FetchError,
+               case .http(let code) = fe, code == 401 || code == 403 {
+                DispatchQueue.global(qos: .utility).async {
+                    guard let fresh = refreshCredentials(creds),
+                          let t = fresh.accessToken else {
+                        DispatchQueue.main.async { completion(result) }
+                        return
                     }
-                    return
+                    requestUsage(token: t, completion: completion)
                 }
-                if let data = data, let usage = parseUsage(data) {
-                    completion(.success(usage))
-                } else {
-                    completion(.failure(FetchError.badResponse))
-                }
+                return
             }
-        }.resume()
+            completion(result)
+        }
     }
 }
 
@@ -749,6 +934,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.rateLimitedUntil = nil
                 self.setStatus(.systemGreen, "Live")
                 self.updateFooter()
+                // The launch-time profile fetch fails when the app starts with
+                // an expired token; backfill the user line after the token
+                // refresh got a poll through.
+                if self.userLabel.stringValue
+                    .trimmingCharacters(in: .whitespaces).isEmpty {
+                    fetchProfile { [weak self] label in
+                        self?.userLabel.stringValue = label ?? ""
+                    }
+                }
             case .failure(let err):
                 // Nothing is written into the panel on failure: the rows and
                 // footer keep the last known values and only the dot changes.

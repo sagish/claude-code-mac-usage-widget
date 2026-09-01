@@ -54,9 +54,14 @@ project) that shows Claude Code usage limits. All application code lives in
 
 ## Security constraints
 
-- The OAuth token must never be logged, printed, or sent anywhere except
-  `api.anthropic.com`. Debug scripts print response bodies only, never the
-  token or raw credentials.
+- The OAuth tokens must never be logged or printed. The access token is sent
+  only to `api.anthropic.com`; the refresh token only to Anthropic's OAuth
+  token endpoint (`console.anthropic.com/v1/oauth/token`) in the refresh
+  grant. Debug scripts print response bodies only, never the token or raw
+  credentials.
+- Credential write-back (after a token refresh) must keep tokens out of
+  process argument lists: the Keychain write goes through `security -i` with
+  the command fed via stdin — never pass the JSON as a CLI argument.
 - Do not add analytics, crash reporting, or any third-party network calls.
 
 ## PR / commit guidelines

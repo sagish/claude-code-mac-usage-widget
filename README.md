@@ -40,8 +40,11 @@ Reads your Claude Code OAuth token from the macOS Keychain (item
 `Claude Code-credentials`, falling back to `~/.claude/.credentials.json`) and
 polls `https://api.anthropic.com/api/oauth/usage` every 5 minutes — slow on
 purpose, so the widget never trips the API's rate limit. Your name and org come
-from `/api/oauth/profile`. The token never leaves your machine except to
-Anthropic's API.
+from `/api/oauth/profile`. When the token expires, the widget renews it with
+the same OAuth refresh grant Claude Code uses and stores the result back, so
+it keeps working (and keeps Claude Code signed in) even if you haven't opened
+Claude Code in a while. Tokens never leave your machine except to Anthropic's
+API and OAuth endpoints.
 
 ## Build & run
 

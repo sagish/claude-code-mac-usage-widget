@@ -22,10 +22,37 @@ session, all-models weekly, and the model-scoped weekly limit (currently
    the read falls through to the file fallback.
 2. Fallback: `~/.claude/.credentials.json`.
 
-Either yields JSON containing `claudeAiOauth.accessToken`. The token is
-re-read on every poll, so tokens refreshed by Claude Code are picked up
-without restarting. The token is used only as a `Bearer` header to
-`api.anthropic.com` and is never persisted, logged, or displayed.
+Either yields JSON containing `claudeAiOauth.accessToken` (plus
+`refreshToken`, `expiresAt` in epoch ms, and metadata such as `scopes` and
+`subscriptionType`). The credentials are re-read on every poll, so tokens
+refreshed by Claude Code are picked up without restarting. The access token
+is used only as a `Bearer` header to `api.anthropic.com`; the refresh token
+only in the refresh grant below. Neither is ever logged or displayed.
+
+### Token refresh
+
+When the stored access token is expired (or within 60 s of `expiresAt`), the
+widget renews it itself before polling, exactly as Claude Code would:
+`POST https://console.anthropic.com/v1/oauth/token` with a JSON body
+`{grant_type: refresh_token, refresh_token, client_id}` using Claude Code's
+public client ID (`9d1c250a-e61b-44d9-88ed-5944d1962f5e`), 15 s timeout.
+
+- On success, `accessToken`, `refreshToken` (the endpoint rotates them; the
+  old one is kept only if the response omits a new one), and `expiresAt`
+  (now + `expires_in`) are merged into the credentials JSON — all other
+  fields preserved — and written back to the store they were read from,
+  never the other one. Keychain write-back goes through `security -i` with
+  the command on stdin, so the token JSON never appears in a process
+  argument list; file write-back is atomic with `0600` permissions.
+  Persisting matters: rotation can invalidate the previous refresh token,
+  so skipping the write would silently sign Claude Code out.
+- A 401/403 from the usage endpoint triggers one reactive refresh + retry
+  of the poll (covers revocation and clock skew).
+- Attempts are gated to at most one per 60 s, so a dead refresh token can
+  never hammer the token endpoint; on failure the poll proceeds with the
+  stale token and the normal error path reports it (red dot, "Sign-in
+  expired — open Claude Code" — now only seen when the refresh itself
+  failed, e.g. after signing out of Claude Code).
 
 ### Endpoints
 
@@ -45,7 +72,9 @@ Both called with headers `Authorization: Bearer <token>` and
     fractions and scaled ×100.
 - `GET https://api.anthropic.com/api/oauth/profile` — fetched once at launch.
   Renders `account.full_name` (fallback `display_name`, then `email`) and
-  `organization.name` as `"<name> · <org>"`.
+  `organization.name` as `"<name> · <org>"`. If the user line is still blank
+  after a successful usage poll (the launch fetch ran against an expired
+  token), it is fetched again.
 
 ## Window behavior
 
@@ -166,6 +195,5 @@ Refresh now · Quit Claude Usage Widget.
 ## Non-goals
 
 Extra-usage credits, spend, per-surface scopes, and the other buckets in the
-usage response are intentionally ignored. No auto-token-refresh via the
-OAuth refresh token — the widget relies on Claude Code keeping the token
-fresh.
+usage response are intentionally ignored. No interactive sign-in flow — if
+the refresh token itself is dead, the user must sign in via Claude Code.
