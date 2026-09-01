@@ -798,12 +798,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.orderFrontRegardless()
     }
 
-    /// Status item shows Session and the model-scoped weekly (e.g. Fable) as
-    /// `S 42% · F 9%` — each number tinted with its bar's warning colors; all
-    /// three metrics go in the tooltip.
+    /// Status item shows Session, the all-models weekly and the model-scoped
+    /// weekly (e.g. Fable) as `S 42% · W 18% · F 9%` — each number tinted with
+    /// its bar's warning colors; the same three metrics, spelled out, go in
+    /// the tooltip.
     func updateStatusTitle() {
         guard let btn = statusItem?.button else { return }
-        guard lastUsage?.session != nil || lastUsage?.fable != nil else {
+        guard lastUsage?.session != nil || lastUsage?.weekly != nil
+            || lastUsage?.fable != nil else {
             btn.title = "–"
             btn.toolTip = "Claude usage — waiting for data"
             return
@@ -813,6 +815,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let title = NSMutableAttributedString()
         let shown: [(String, Metric?)] = [
             ("S", lastUsage?.session),
+            ("W", lastUsage?.weekly),
             (String(fableName.prefix(1)), lastUsage?.fable),
         ]
         for (i, (tag, m)) in shown.enumerated() {
