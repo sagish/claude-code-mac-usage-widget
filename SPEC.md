@@ -68,8 +68,9 @@ Both called with headers `Authorization: Bearer <token>` and
   - **Fallback parse** (if `limits` is absent): top-level `five_hour`,
     `seven_day`, and the first non-null of `seven_day_fable` /
     `seven_day_opus` / `seven_day_sonnet`, each `{utilization, resets_at}`.
-  - Normalization: if all parsed values are ≤ 1.5 they are treated as
-    fractions and scaled ×100.
+  - No normalization: both `percent` and `utilization` are 0–100 values and
+    are used as-is. (An earlier "scale ×100 if everything is ≤ 1.5"
+    heuristic turned a real 1 % session into 100 %.)
 - `GET https://api.anthropic.com/api/oauth/profile` — fetched once at launch.
   Renders `account.full_name` (fallback `display_name`, then `email`) and
   `organization.name` as `"<name> · <org>"`. If the user line is still blank

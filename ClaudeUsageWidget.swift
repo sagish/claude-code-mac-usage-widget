@@ -311,13 +311,9 @@ func parseUsage(_ data: Data) -> Usage? {
     }
     guard u.session != nil || u.weekly != nil || u.fable != nil else { return nil }
 
-    // Normalize: if every value is a 0–1 fraction, scale to percent.
-    let vals = [u.session?.pct, u.weekly?.pct, u.fable?.pct].compactMap { $0 }
-    if let mx = vals.max(), mx <= 1.5 {
-        u.session?.pct *= 100
-        u.weekly?.pct *= 100
-        u.fable?.pct *= 100
-    }
+    // Both `limits[].percent` and the legacy `utilization` fields are already
+    // 0–100 percentages. Do not try to detect 0–1 fractions here: a genuine
+    // 1% session reads as a fraction and gets inflated to 100%.
     return u
 }
 
