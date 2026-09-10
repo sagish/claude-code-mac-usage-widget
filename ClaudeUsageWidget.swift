@@ -33,6 +33,9 @@ enum FetchError: Error {
     case badResponse
 }
 
+/// JSON numbers arrive as `NSNumber`, so an Int and a Double read the same way.
+func jsonNumber(_ any: Any?) -> Double? { (any as? NSNumber)?.doubleValue }
+
 // MARK: - Credentials
 
 /// How long to wait for `security` before giving up on the Keychain. The
@@ -65,34 +68,52 @@ struct Credentials {
     var accessToken: String? { oauth?["accessToken"] as? String }
     var refreshToken: String? { oauth?["refreshToken"] as? String }
     /// Milliseconds since the epoch, as Claude Code stores it.
-    var expiresAtMs: Double? { (oauth?["expiresAt"] as? NSNumber)?.doubleValue }
+    var expiresAtMs: Double? { oauth.flatMap { jsonNumber($0["expiresAt"]) } }
+}
+
+/// Runs /usr/bin/security with a bounded wait. The first Keychain access (and
+/// any access while it is locked) shows a macOS prompt; an unanswered prompt
+/// must not wedge the poll chain, so the process is killed after
+/// `keychainTimeout`. Returns stdout on exit status 0, nil otherwise.
+@discardableResult
+private func runSecurity(_ args: [String], stdin: String? = nil) -> Data? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = args
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = Pipe()
+    var inPipe: Pipe?
+    if stdin != nil { let ip = Pipe(); p.standardInput = ip; inPipe = ip }
+    // Installed before run() so a process that exits immediately still signals.
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    guard (try? p.run()) != nil else { return nil }
+    if let ip = inPipe {
+        // The close must happen even if the encode fails — `security -i` reads
+        // until EOF and would otherwise wait forever.
+        if let d = stdin?.data(using: .utf8) { ip.fileHandleForWriting.write(d) }
+        ip.fileHandleForWriting.closeFile()
+    }
+    if done.wait(timeout: .now() + keychainTimeout) == .timedOut {
+        p.terminate()
+        if done.wait(timeout: .now() + 2) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)
+            _ = done.wait(timeout: .now() + 2)
+        }
+        return nil
+    }
+    guard p.terminationStatus == 0 else { return nil }
+    return out.fileHandleForReading.readDataToEndOfFile()
 }
 
 func readCredentialsString() -> (raw: String, source: CredentialSource)? {
-    // 1) macOS Keychain (default storage on Mac)
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", keychainService, "-w"]
-    let pipe = Pipe()
-    p.standardOutput = pipe
-    p.standardError = Pipe()
-    if (try? p.run()) != nil {
-        let done = DispatchSemaphore(value: 0)
-        p.terminationHandler = { _ in done.signal() }
-        if done.wait(timeout: .now() + keychainTimeout) == .timedOut {
-            // Blocked on an unanswered prompt: kill it and fall through to the
-            // file fallback rather than hanging the fetch forever.
-            p.terminate()
-            if done.wait(timeout: .now() + 2) == .timedOut {
-                kill(p.processIdentifier, SIGKILL)
-                _ = done.wait(timeout: .now() + 2)
-            }
-        } else if p.terminationStatus == 0 {
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let s = String(data: data, encoding: .utf8), !s.isEmpty {
-                return (s.trimmingCharacters(in: .whitespacesAndNewlines), .keychain)
-            }
-        }
+    // 1) macOS Keychain (default storage on Mac). On timeout or failure fall
+    // through to the file rather than hanging the fetch.
+    if let data = runSecurity(["find-generic-password", "-s", keychainService, "-w"]),
+       let s = String(data: data, encoding: .utf8) {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return (trimmed, .keychain) }
     }
     // 2) Plain-file fallback
     if let d = try? Data(contentsOf: credentialsFileURL),
@@ -107,16 +128,10 @@ func readCredentials() -> Credentials? {
           let data = raw.data(using: .utf8),
           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     else { return nil }
-    if obj["claudeAiOauth"] as? [String: Any] != nil {
-        return Credentials(root: obj, source: source, nested: true)
-    }
-    if obj["accessToken"] as? String != nil {
-        return Credentials(root: obj, source: source, nested: false)
-    }
-    return nil
+    let nested = obj["claudeAiOauth"] as? [String: Any] != nil
+    guard nested || obj["accessToken"] as? String != nil else { return nil }
+    return Credentials(root: obj, source: source, nested: nested)
 }
-
-func accessToken() -> String? { readCredentials()?.accessToken }
 
 // MARK: - Token refresh
 
@@ -175,7 +190,7 @@ func refreshCredentials(_ creds: Credentials) -> Credentials? {
         else { return }
         newAccess = obj["access_token"] as? String
         newRefresh = obj["refresh_token"] as? String
-        expiresIn = (obj["expires_in"] as? NSNumber)?.doubleValue
+        expiresIn = jsonNumber(obj["expires_in"])
     }.resume()
     _ = done.wait(timeout: .now() + 20)
 
@@ -216,40 +231,26 @@ func persistCredentials(_ creds: Credentials) {
             .replacingOccurrences(of: "\"", with: "\\\"")
         let cmd = "add-generic-password -U -a \"\(NSUserName())\" "
             + "-s \"\(keychainService)\" -w \"\(escaped)\"\n"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["-i"]
-        let inPipe = Pipe()
-        p.standardInput = inPipe
-        p.standardOutput = Pipe()
-        p.standardError = Pipe()
-        guard (try? p.run()) != nil else { return }
-        if let d = cmd.data(using: .utf8) {
-            inPipe.fileHandleForWriting.write(d)
-        }
-        inPipe.fileHandleForWriting.closeFile()
-        // Same bounded wait as the keychain read: never hang the poll chain.
-        let done = DispatchSemaphore(value: 0)
-        p.terminationHandler = { _ in done.signal() }
-        if done.wait(timeout: .now() + keychainTimeout) == .timedOut {
-            p.terminate()
-        }
+        runSecurity(["-i"], stdin: cmd)
     }
 }
 
 // MARK: - Fetch + parse
 
+/// Accepts an epoch number or an ISO-8601 string, with or without fractional
+/// seconds.
 func parseDate(_ any: Any?) -> Date? {
-    guard let s = any as? String else {
-        if let t = any as? Double { return Date(timeIntervalSince1970: t) }
-        return nil
+    if let t = jsonNumber(any) { return Date(timeIntervalSince1970: t) }
+    guard let s = any as? String else { return nil }
+    let optionSets: [ISO8601DateFormatter.Options] = [
+        [.withInternetDateTime, .withFractionalSeconds], [.withInternetDateTime],
+    ]
+    for opts in optionSets {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = opts
+        if let d = f.date(from: s) { return d }
     }
-    let f1 = ISO8601DateFormatter()
-    f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let d = f1.date(from: s) { return d }
-    let f2 = ISO8601DateFormatter()
-    f2.formatOptions = [.withInternetDateTime]
-    return f2.date(from: s)
+    return nil
 }
 
 /// `Retry-After` is either a number of seconds or an HTTP date.
@@ -271,10 +272,8 @@ func parseUsage(_ data: Data) -> Usage? {
 
     func metric(_ any: Any?) -> Metric? {
         guard let d = any as? [String: Any] else { return nil }
-        let raw = (d["utilization"] as? Double)
-            ?? (d["utilization"] as? Int).map(Double.init)
-            ?? (d["used_percent"] as? Double)
-        guard let v = raw else { return nil }
+        guard let v = jsonNumber(d["utilization"]) ?? jsonNumber(d["used_percent"])
+        else { return nil }
         return Metric(pct: v, resetsAt: parseDate(d["resets_at"] ?? d["resetsAt"]))
     }
 
@@ -283,8 +282,7 @@ func parseUsage(_ data: Data) -> Usage? {
     // Primary source: the `limits` array (session / weekly_all / weekly_scoped).
     if let limits = obj["limits"] as? [[String: Any]] {
         for l in limits {
-            let raw = (l["percent"] as? Double) ?? (l["percent"] as? Int).map(Double.init)
-            guard let p = raw else { continue }
+            guard let p = jsonNumber(l["percent"]) else { continue }
             let m = Metric(pct: p, resetsAt: parseDate(l["resets_at"]))
             switch l["kind"] as? String {
             case "session": u.session = m
@@ -317,12 +315,19 @@ func parseUsage(_ data: Data) -> Usage? {
     return u
 }
 
-/// One GET of the usage endpoint. Completes on the main queue.
-func requestUsage(token: String, completion: @escaping (Result<Usage, Error>) -> Void) {
-    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+/// Bearer + beta header for the two api.anthropic.com OAuth endpoints. The
+/// access token goes nowhere else.
+func oauthGET(_ url: URL, token: String) -> URLRequest {
+    var req = URLRequest(url: url)
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     req.timeoutInterval = 15
+    return req
+}
+
+/// One GET of the usage endpoint. Completes on the main queue.
+func requestUsage(token: String, completion: @escaping (Result<Usage, Error>) -> Void) {
+    let req = oauthGET(URL(string: "https://api.anthropic.com/api/oauth/usage")!, token: token)
     URLSession.shared.dataTask(with: req) { data, resp, err in
         DispatchQueue.main.async {
             if let err = err { completion(.failure(err)); return }
@@ -385,14 +390,12 @@ func fetchUsage(completion: @escaping (Result<Usage, Error>) -> Void) {
 
 func fetchProfile(completion: @escaping (String?) -> Void) {
     DispatchQueue.global(qos: .utility).async {
-        guard let token = accessToken() else {
+        guard let token = readCredentials()?.accessToken else {
             DispatchQueue.main.async { completion(nil) }
             return
         }
-        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/profile")!)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        req.timeoutInterval = 15
+        let req = oauthGET(
+            URL(string: "https://api.anthropic.com/api/oauth/profile")!, token: token)
         URLSession.shared.dataTask(with: req) { data, _, _ in
             var result: String?
             if let data = data,
@@ -402,12 +405,8 @@ func fetchProfile(completion: @escaping (String?) -> Void) {
                     ?? (account?["display_name"] as? String)
                     ?? (account?["email"] as? String)
                 let org = (obj["organization"] as? [String: Any])?["name"] as? String
-                switch (name, org) {
-                case let (n?, o?): result = "\(n) · \(o)"
-                case let (n?, nil): result = n
-                case let (nil, o?): result = o
-                default: result = nil
-                }
+                let parts = [name, org].compactMap { $0 }
+                result = parts.isEmpty ? nil : parts.joined(separator: " · ")
             }
             DispatchQueue.main.async { completion(result) }
         }.resume()
@@ -415,6 +414,23 @@ func fetchProfile(completion: @escaping (String?) -> Void) {
 }
 
 // MARK: - Views
+
+let claudeBlue = NSColor(srgbRed: 0.31, green: 0.47, blue: 0.90, alpha: 1) // claude.ai blue
+
+/// Warning tint for a utilization percentage; nil means "no warning".
+func warningColor(_ v: Double) -> NSColor? {
+    if v >= 90 { return .systemRed }
+    if v >= 70 { return .systemOrange }
+    return nil
+}
+
+/// Formats with the current locale and time zone; used for the "updated" and
+/// "Resets" stamps.
+func formatTime(_ date: Date, _ format: String) -> String {
+    let f = DateFormatter()
+    f.dateFormat = format
+    return f.string(from: date)
+}
 
 final class PulsingDot: NSView {
     private let dot = CALayer()
@@ -453,14 +469,8 @@ final class BarView: NSView {
         guard v > 0.5 else { return }
         let w = max(r.height, r.width * CGFloat(v) / 100.0)
         let fillRect = NSRect(x: 0, y: 0, width: w, height: r.height)
-        barColor(v).setFill()
+        (warningColor(v) ?? claudeBlue).setFill()
         NSBezierPath(roundedRect: fillRect, xRadius: radius, yRadius: radius).fill()
-    }
-
-    private func barColor(_ v: Double) -> NSColor {
-        if v >= 90 { return .systemRed }
-        if v >= 70 { return .systemOrange }
-        return NSColor(srgbRed: 0.31, green: 0.47, blue: 0.90, alpha: 1) // claude.ai blue
     }
 }
 
@@ -477,7 +487,7 @@ final class Row {
         pct.alignment = .right
     }
 
-    func update(_ m: Metric?, resetPrefix: String) {
+    func update(_ m: Metric?) {
         guard let m = m else {
             pct.stringValue = "–"
             bar.value = 0
@@ -487,9 +497,7 @@ final class Row {
         pct.stringValue = "\(Int(m.pct.rounded()))%"
         bar.value = m.pct
         if let d = m.resetsAt {
-            let f = DateFormatter()
-            f.dateFormat = "EEE h:mm a"
-            bar.toolTip = "\(resetPrefix) \(f.string(from: d))"
+            bar.toolTip = "Resets \(formatTime(d, "EEE h:mm a"))"
             name.toolTip = bar.toolTip
         }
     }
@@ -534,6 +542,9 @@ func setStartAtLogin(_ enabled: Bool) {
 
 // MARK: - App
 
+/// Floor for every poll delay — the usage endpoint 429s if hit more often.
+let basePoll: TimeInterval = 5 * 60
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var panel: NSPanel!
     let sessionRow = Row(title: "Session")
@@ -559,10 +570,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // days — and the timer is rescheduled after every attempt instead of firing
     // on a fixed beat: successes go back to `basePoll`, failures double the
     // delay up to `maxPoll`, and a 429 honours Retry-After.
-    let basePoll: TimeInterval = 5 * 60
     let maxPoll: TimeInterval = 30 * 60
     let minFetchGap: TimeInterval = 30 // debounces the ↻ button
-    var pollInterval: TimeInterval = 5 * 60
+    var pollInterval: TimeInterval = basePoll
     var nextFetchAllowed = Date.distantPast
     var rateLimitedUntil: Date?
     var lastFetchStarted: Date?
@@ -582,9 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             options: [.userInitiated], reason: "usage polling")
         buildPanel()
         refresh()
-        fetchProfile { [weak self] label in
-            self?.userLabel.stringValue = label ?? ""
-        }
+        loadProfile()
         // Tick the "resets in Xh Ym" footer (and any cool-off countdown)
         // between fetches
         // …and double as a watchdog: scheduling is a chain (each attempt
@@ -606,10 +614,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
         ) { [weak self] _ in
             guard let self = self else { return }
-            self.pollInterval = self.basePoll
+            self.pollInterval = basePoll
             self.nextFetchAllowed = Date.distantPast
             self.scheduleNextPoll(after: 5)
         }
+    }
+
+    func loadProfile() {
+        fetchProfile { [weak self] label in self?.userLabel.stringValue = label ?? "" }
+    }
+
+    /// The same right-click menu in both modes; only the menu-bar mode offers
+    /// the way back to the floating panel.
+    func buildMenu(withLeaveMenuBar: Bool) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
+        if withLeaveMenuBar {
+            menu.addItem(NSMenuItem(title: "Move back to floating widget", action: #selector(leaveMenuBar), keyEquivalent: ""))
+        }
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit Claude Usage Widget", action: #selector(quit), keyEquivalent: "q"))
+        menu.items.forEach { $0.target = self }
+        return menu
     }
 
     func buildPanel() {
@@ -637,18 +663,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.contentView = effect
 
         let pad: CGFloat = 12
+        let right = width - pad
         let title = NSTextField(labelWithString: "Claude usage")
         title.font = .systemFont(ofSize: 11, weight: .semibold)
         title.frame = NSRect(x: pad, y: height - 26, width: 150, height: 14)
         effect.addSubview(title)
 
-        liveDot.frame = NSRect(x: width - pad - 34, y: height - 21.5, width: 7, height: 7)
+        liveDot.frame = NSRect(x: right - 34, y: height - 21.5, width: 7, height: 7)
         effect.addSubview(liveDot)
 
         let refreshBtn = NSButton(title: "↻", target: self, action: #selector(refreshClicked))
         refreshBtn.isBordered = false
         refreshBtn.font = .systemFont(ofSize: 12)
-        refreshBtn.frame = NSRect(x: width - pad - 18, y: height - 28, width: 18, height: 18)
+        refreshBtn.frame = NSRect(x: right - 18, y: height - 28, width: 18, height: 18)
         effect.addSubview(refreshBtn)
 
         userLabel.font = .systemFont(ofSize: 9)
@@ -659,8 +686,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         func place(_ row: Row, y: CGFloat) {
             row.name.frame = NSRect(x: pad, y: y, width: 66, height: 14)
-            row.bar.frame = NSRect(x: pad + 70, y: y + 3.5, width: width - pad * 2 - 70 - 38, height: 7)
-            row.pct.frame = NSRect(x: width - pad - 34, y: y, width: 34, height: 14)
+            row.bar.frame = NSRect(x: pad + 70, y: y + 3.5, width: right - pad - 70 - 38, height: 7)
+            row.pct.frame = NSRect(x: right - 34, y: y, width: 34, height: 14)
             effect.addSubview(row.name)
             effect.addSubview(row.bar)
             effect.addSubview(row.pct)
@@ -683,30 +710,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         footer.lineBreakMode = .byTruncatingTail
         effect.addSubview(footer)
 
-        let loginToggle = NSButton(checkboxWithTitle: "Start at login",
-                                   target: self, action: #selector(loginToggled(_:)))
-        loginToggle.controlSize = .mini
-        loginToggle.font = .systemFont(ofSize: 9)
-        loginToggle.frame = NSRect(x: pad - 2, y: 4, width: 120, height: 16)
+        func checkbox(_ title: String, _ action: Selector,
+                      x: CGFloat, w: CGFloat, tip: String) -> NSButton {
+            let b = NSButton(checkboxWithTitle: title, target: self, action: action)
+            b.controlSize = .mini
+            b.font = .systemFont(ofSize: 9)
+            b.frame = NSRect(x: x, y: 4, width: w, height: 16)
+            b.toolTip = tip
+            effect.addSubview(b)
+            return b
+        }
+
+        let loginToggle = checkbox(
+            "Start at login", #selector(loginToggled(_:)), x: pad - 2, w: 120,
+            tip: "Launch the widget automatically when you log in")
         loginToggle.state = FileManager.default.fileExists(atPath: agentPlistURL.path) ? .on : .off
-        loginToggle.toolTip = "Launch the widget automatically when you log in"
-        effect.addSubview(loginToggle)
 
-        menuBarToggle = NSButton(checkboxWithTitle: "Menu bar",
-                                 target: self, action: #selector(menuBarToggled(_:)))
-        menuBarToggle.controlSize = .mini
-        menuBarToggle.font = .systemFont(ofSize: 9)
-        menuBarToggle.frame = NSRect(x: width - pad - 78, y: 4, width: 80, height: 16)
+        menuBarToggle = checkbox(
+            "Menu bar", #selector(menuBarToggled(_:)), x: right - 78, w: 80,
+            tip: "Tuck the widget into the menu bar instead of floating over windows")
         menuBarToggle.state = UserDefaults.standard.bool(forKey: inMenuBarKey) ? .on : .off
-        menuBarToggle.toolTip = "Tuck the widget into the menu bar instead of floating over windows"
-        effect.addSubview(menuBarToggle)
 
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Claude Usage Widget", action: #selector(quit), keyEquivalent: "q"))
-        menu.items.forEach { $0.target = self }
-        effect.menu = menu
+        effect.menu = buildMenu(withLeaveMenuBar: false)
 
         // Restore last position, default to top-right corner
         panel.setFrameAutosaveName("ClaudeUsageWidget")
@@ -766,13 +791,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func statusClicked() {
         guard let btn = statusItem?.button else { return }
         if NSApp.currentEvent?.type == .rightMouseUp {
-            let menu = NSMenu()
-            menu.addItem(NSMenuItem(title: "Refresh now", action: #selector(refreshClicked), keyEquivalent: "r"))
-            menu.addItem(NSMenuItem(title: "Move back to floating widget", action: #selector(leaveMenuBar), keyEquivalent: ""))
-            menu.addItem(.separator())
-            menu.addItem(NSMenuItem(title: "Quit Claude Usage Widget", action: #selector(quit), keyEquivalent: "q"))
-            menu.items.forEach { $0.target = self }
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: btn.bounds.maxY + 4), in: btn)
+            buildMenu(withLeaveMenuBar: true)
+                .popUp(positioning: nil, at: NSPoint(x: 0, y: btn.bounds.maxY + 4), in: btn)
             return
         }
         togglePanelUnderStatusItem()
@@ -800,46 +820,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the tooltip.
     func updateStatusTitle() {
         guard let btn = statusItem?.button else { return }
-        guard lastUsage?.session != nil || lastUsage?.weekly != nil
-            || lastUsage?.fable != nil else {
+        let fableName = fableRow.name.stringValue
+        let metrics: [(tag: String, name: String, m: Metric?)] = [
+            ("S", "Session", lastUsage?.session),
+            ("W", "All models", lastUsage?.weekly),
+            (String(fableName.prefix(1)), fableName, lastUsage?.fable),
+        ]
+        guard metrics.contains(where: { $0.m != nil }) else {
             btn.title = "–"
             btn.toolTip = "Claude usage — waiting for data"
             return
         }
-        let fableName = fableRow.name.stringValue
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let title = NSMutableAttributedString()
-        let shown: [(String, Metric?)] = [
-            ("S", lastUsage?.session),
-            ("W", lastUsage?.weekly),
-            (String(fableName.prefix(1)), lastUsage?.fable),
-        ]
-        for (i, (tag, m)) in shown.enumerated() {
+        for (i, entry) in metrics.enumerated() {
             if i > 0 {
                 title.append(NSAttributedString(string: " · ", attributes: [
                     .font: font, .foregroundColor: NSColor.tertiaryLabelColor,
                 ]))
             }
-            title.append(NSAttributedString(string: "\(tag) ", attributes: [
+            title.append(NSAttributedString(string: "\(entry.tag) ", attributes: [
                 .font: font, .foregroundColor: NSColor.secondaryLabelColor,
             ]))
             var attrs: [NSAttributedString.Key: Any] = [.font: font]
-            if let p = m?.pct {
-                if p >= 90 { attrs[.foregroundColor] = NSColor.systemRed }
-                else if p >= 70 { attrs[.foregroundColor] = NSColor.systemOrange }
+            if let p = entry.m?.pct {
+                if let c = warningColor(p) { attrs[.foregroundColor] = c }
                 title.append(NSAttributedString(string: "\(Int(p.rounded()))%", attributes: attrs))
             } else {
                 title.append(NSAttributedString(string: "–", attributes: attrs))
             }
         }
         btn.attributedTitle = title
-        let all: [(String, Metric?)] = [
-            ("Session", lastUsage?.session),
-            ("All models", lastUsage?.weekly),
-            (fableName, lastUsage?.fable),
-        ]
-        btn.toolTip = "Claude usage — " + all
-            .compactMap { name, m in m.map { "\(name) \(Int($0.pct.rounded()))%" } }
+        btn.toolTip = "Claude usage — " + metrics
+            .compactMap { entry in entry.m.map { "\(entry.name) \(Int($0.pct.rounded()))%" } }
             .joined(separator: " · ")
     }
 
@@ -882,9 +895,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func setStatus(_ color: NSColor, _ tip: String) {
         liveDot.color = color
         guard let last = lastSuccess else { liveDot.toolTip = tip; return }
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        liveDot.toolTip = "\(tip) · updated \(f.string(from: last))"
+        liveDot.toolTip = "\(tip) · updated \(formatTime(last, "h:mm a"))"
     }
 
     /// Sends at most one request at a time, never before `nextFetchAllowed`,
@@ -921,15 +932,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.isFetching = false
             switch result {
             case .success(let usage):
-                self.sessionRow.update(usage.session, resetPrefix: "Resets")
-                self.weeklyRow.update(usage.weekly, resetPrefix: "Resets")
-                self.fableRow.update(usage.fable, resetPrefix: "Resets")
+                self.sessionRow.update(usage.session)
+                self.weeklyRow.update(usage.weekly)
+                self.fableRow.update(usage.fable)
                 if let label = usage.fableLabel { self.fableRow.name.stringValue = label }
                 self.lastUsage = usage
                 self.updateStatusTitle()
                 self.sessionResetsAt = usage.session?.resetsAt
                 self.lastSuccess = Date()
-                self.pollInterval = self.basePoll
+                self.pollInterval = basePoll
                 self.rateLimitedUntil = nil
                 self.setStatus(.systemGreen, "Live")
                 self.updateFooter()
@@ -938,9 +949,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // refresh got a poll through.
                 if self.userLabel.stringValue
                     .trimmingCharacters(in: .whitespaces).isEmpty {
-                    fetchProfile { [weak self] label in
-                        self?.userLabel.stringValue = label ?? ""
-                    }
+                    self.loadProfile()
                 }
             case .failure(let err):
                 // Nothing is written into the panel on failure: the rows and
@@ -955,7 +964,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case FetchError.http(let code) where code == 401 || code == 403:
                     self.setStatus(.systemRed, "Sign-in expired — open Claude Code")
                 case FetchError.rateLimited(let after):
-                    retry = min(max(after ?? retry, self.basePoll), self.maxPoll)
+                    retry = min(max(after ?? retry, basePoll), self.maxPoll)
                     self.rateLimitedUntil = Date().addingTimeInterval(retry)
                     self.setStatus(.systemYellow, "Paused — Claude asked to slow down")
                 default:
@@ -977,9 +986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if sawFailure { footer.stringValue = "no data yet" }
             return
         }
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        let stamp = "updated \(f.string(from: last))"
+        let stamp = "updated \(formatTime(last, "h:mm a"))"
         guard let d = sessionResetsAt else { footer.stringValue = stamp; return }
         let secs = Int(d.timeIntervalSinceNow)
         if secs > 0 {
