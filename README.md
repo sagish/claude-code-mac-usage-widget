@@ -8,10 +8,6 @@ Native Swift/AppKit, no dependencies.
 
 ![Claude Usage Widget](screenshot.png)
 
-Or tuck it into the menu bar instead:
-
-![Menu bar mode](menubar.png)
-
 ## Quick setup
 
 1. **Prereqs**: Xcode Command Line Tools (`xcode-select --install`) and a

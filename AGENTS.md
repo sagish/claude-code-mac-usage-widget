@@ -61,6 +61,6 @@ update it there, don't restate it here.
 ## PR / commit guidelines
 
 - Update `SPEC.md` when behavior changes, `README.md` when setup or user-visible
-  features change, and `screenshot.png` (or `menubar.png`) after UI changes
+  features change, and `screenshot.png` after UI changes
   (capture the live widget).
 - Commit messages: imperative summary line; body explains the why.
