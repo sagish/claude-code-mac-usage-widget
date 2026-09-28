@@ -6,7 +6,7 @@ as [claude.ai/settings/usage](https://claude.ai/settings/usage).
 
 Native Swift/AppKit, no dependencies.
 
-![Claude Usage Widget](screenshot.png)
+![Claude Usage Widget](claude-usage-widget-promo.png)
 
 ## Quick setup
 
