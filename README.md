@@ -23,9 +23,11 @@ Native Swift/AppKit, no dependencies.
    ./start --force  # always rebuild
    ./start --stop   # stop the running widget
    ```
-   On first run macOS asks to allow Keychain access to your Claude Code
-   credentials — click **Always Allow**. The widget appears in the top-right
-   corner; drag it wherever you like.
+   The widget reads your Claude Code credentials through Apple's `security`
+   tool, which Claude Code itself uses, so there's usually no prompt. If macOS
+   does ask, note that **Always Allow** lets any program that runs `security`
+   read that Keychain item without asking; **Allow** grants just this once.
+   The widget appears in the top-right corner; drag it wherever you like.
 4. **(Optional) Start at login**: tick the checkbox at the bottom of the widget.
    It writes `~/Library/LaunchAgents/com.empathy.claude-usage-widget.plist`
    pointing at the binary's current location; untick to remove it. Effective at

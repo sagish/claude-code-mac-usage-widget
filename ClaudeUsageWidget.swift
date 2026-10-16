@@ -168,11 +168,45 @@ private let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 /// lapses mid-poll doesn't cost a wasted usage request.
 private let refreshExpiryBuffer: TimeInterval = 60
 
+/// Every credential read/refresh/write runs on this one serial queue, so two
+/// fetches (e.g. after the stuck-fetch guard is released) can never race on
+/// the Keychain item or on the state below.
+let fetchQueue = DispatchQueue(label: "claude-usage-widget.fetch", qos: .utility)
+
 /// Attempts are gated so a dead refresh token (revoked, signed out) can never
-/// turn the poll loop into a hammer on the token endpoint. Only touched from
-/// the single-flight fetch path, so no extra synchronization is needed.
+/// turn the poll loop into a hammer on the token endpoint. `fetchQueue` only.
 private var lastRefreshAttempt: Date?
 private let refreshAttemptGap: TimeInterval = 60
+
+/// A refresh whose rotated tokens could not be written back. The old refresh
+/// token is already spent, so these are the only live tokens: they are kept
+/// in memory, used for polling, and the write is retried every poll until it
+/// lands. `fetchQueue` only.
+private var unsavedRefresh: (fields: [String: Any], spent: String, creds: Credentials)?
+
+/// Hard 30 s cap on the whole token exchange, enforced by URLSession itself,
+/// so the caller can wait for the response unconditionally. Abandoning it
+/// early would lose a rotation the server has already performed.
+private let refreshSession: URLSession = {
+    let c = URLSessionConfiguration.ephemeral
+    c.timeoutIntervalForRequest = 15
+    c.timeoutIntervalForResource = 30
+    return URLSession(configuration: c)
+}()
+
+enum RefreshResult {
+    case refreshed(Credentials)
+    /// Rotated but not persisted; usable now, retried via `unsavedRefresh`.
+    case unsaved(Credentials)
+    case failed
+
+    var credentials: Credentials? {
+        switch self {
+        case .refreshed(let c), .unsaved(let c): return c
+        case .failed: return nil
+        }
+    }
+}
 
 /// `security -i` reads each stdin line into a fixed 4096-byte buffer: a
 /// longer line is stored truncated (the spilled tail is then parsed as a
@@ -191,21 +225,20 @@ func credentialsNeedRefresh(_ c: Credentials) -> Bool {
     return Date().timeIntervalSince1970 >= ms / 1000 - refreshExpiryBuffer
 }
 
-/// Exchanges the stored refresh token for a fresh access token, persists the
-/// result back to the store it came from, and returns the updated
-/// credentials. Synchronous — call it only from the background fetch queue.
-/// Returns nil on any failure; callers then proceed with the stale token and
-/// the normal error path (red dot) reports the outcome.
-func refreshCredentials(_ creds: Credentials) -> Credentials? {
+/// Exchanges the stored refresh token for a fresh access token and persists
+/// the result back to the store it came from. Synchronous — `fetchQueue`
+/// only. On `.failed` callers proceed with the stale token and the normal
+/// error path (red dot) reports the outcome.
+func refreshCredentials(_ creds: Credentials) -> RefreshResult {
     if let last = lastRefreshAttempt, -last.timeIntervalSinceNow < refreshAttemptGap {
-        return nil
+        return .failed
     }
-    guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else { return nil }
+    guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else { return .failed }
     // The endpoint rotates the refresh token, so a refresh that can't be
     // written back would invalidate the stored one and sign Claude Code out.
     // Leave the refresh to Claude Code instead (the poll then reports
     // "Sign-in expired — open Claude Code").
-    guard canPersist(creds, headroom: keychainRefreshHeadroom) else { return nil }
+    guard canPersist(creds, headroom: keychainRefreshHeadroom) else { return .failed }
     lastRefreshAttempt = Date()
 
     var req = URLRequest(url: oauthTokenURL)
@@ -222,7 +255,7 @@ func refreshCredentials(_ creds: Credentials) -> Credentials? {
     var newRefresh: String?
     var expiresIn: Double?
     let done = DispatchSemaphore(value: 0)
-    URLSession.shared.dataTask(with: req) { data, resp, _ in
+    refreshSession.dataTask(with: req) { data, resp, _ in
         defer { done.signal() }
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
               let data = data,
@@ -232,22 +265,56 @@ func refreshCredentials(_ creds: Credentials) -> Credentials? {
         newRefresh = obj["refresh_token"] as? String
         expiresIn = jsonNumber(obj["expires_in"])
     }.resume()
-    _ = done.wait(timeout: .now() + 20)
+    // No deadline here: `refreshSession` guarantees the completion within
+    // 30 s, and giving up first would drop tokens the server already rotated.
+    done.wait()
 
-    guard let access = newAccess, !access.isEmpty else { return nil }
+    guard let access = newAccess, !access.isEmpty else { return .failed }
 
-    var updated = creds
-    var oauth = updated.oauth ?? [:]
-    oauth["accessToken"] = access
-    // The endpoint rotates refresh tokens; keep the old one only when the
-    // response omits a new one.
-    if let r = newRefresh, !r.isEmpty { oauth["refreshToken"] = r }
+    // The endpoint rotates refresh tokens; keep the one just used only when
+    // the response omits a new one. Always set, so these fields alone fully
+    // describe the live tokens.
+    var fields: [String: Any] = [
+        "accessToken": access,
+        "refreshToken": (newRefresh?.isEmpty == false ? newRefresh : nil) ?? refreshToken,
+    ]
     if let s = expiresIn {
-        oauth["expiresAt"] = Int((Date().timeIntervalSince1970 + s) * 1000)
+        fields["expiresAt"] = Int((Date().timeIntervalSince1970 + s) * 1000)
     }
-    if updated.nested { updated.root["claudeAiOauth"] = oauth } else { updated.root = oauth }
-    persistCredentials(updated)
-    return updated
+    // While an earlier rotation is still unsaved, the store holds that one's
+    // predecessor, not the token just spent.
+    let expectedStored = unsavedRefresh?.spent ?? refreshToken
+    let result = commitRefresh(fields, spent: expectedStored, snapshot: creds)
+    if case .unsaved(let c) = result {
+        unsavedRefresh = (fields, expectedStored, c)
+    } else {
+        unsavedRefresh = nil
+    }
+    return result
+}
+
+/// Writes refreshed OAuth `fields` into the store's *current* JSON, not the
+/// snapshot the refresh started from, so anything Claude Code changed in the
+/// meantime (e.g. MCP OAuth entries) survives. `spent` is the refresh token
+/// the store is expected to still hold; if it holds a different one, Claude
+/// Code refreshed or signed in again on its own: its credentials win and
+/// nothing is written.
+func commitRefresh(_ fields: [String: Any], spent: String,
+                   snapshot: Credentials) -> RefreshResult {
+    var base = snapshot
+    var storeVisible = false
+    if let current = readCredentials(), current.source == snapshot.source {
+        if current.refreshToken != spent { return .refreshed(current) }
+        base = current
+        storeVisible = true
+    }
+    var oauth = base.oauth ?? [:]
+    for (k, v) in fields { oauth[k] = v }
+    if base.nested { base.root["claudeAiOauth"] = oauth } else { base.root = oauth }
+    // Only write over a store that was just read back: a missing item (signed
+    // out meanwhile) or an unreadable one is never re-created from memory.
+    guard storeVisible, persistCredentials(base) else { return .unsaved(base) }
+    return .refreshed(base)
 }
 
 func credentialsJSON(_ creds: Credentials) -> String? {
@@ -279,15 +346,18 @@ func canPersist(_ creds: Credentials, headroom: Int = 0) -> Bool {
 /// refresh can invalidate the previous refresh token, so skipping this write
 /// would silently sign Claude Code out — but a truncated write is worse (it
 /// destroys the whole item), so an oversized Keychain write is never sent.
-func persistCredentials(_ creds: Credentials) {
-    guard let json = credentialsJSON(creds) else { return }
+/// Returns whether the store now holds exactly `creds`.
+func persistCredentials(_ creds: Credentials) -> Bool {
+    guard let json = credentialsJSON(creds) else { return false }
     switch creds.source {
     case .file:
-        try? Data(json.utf8).write(to: credentialsFileURL, options: .atomic)
+        guard (try? Data(json.utf8).write(to: credentialsFileURL, options: .atomic)) != nil
+        else { return false }
         try? FileManager.default.setAttributes(
             [.posixPermissions: 0o600], ofItemAtPath: credentialsFileURL.path)
+        return true
     case .keychain:
-        guard canPersist(creds) else { return }
+        guard canPersist(creds) else { return false }
         // `security -i` reads its command from stdin, so the token JSON never
         // appears in the process argument list (visible to `ps`). The refresh
         // token has already rotated, so a failed write (locked Keychain, ACL
@@ -295,8 +365,9 @@ func persistCredentials(_ creds: Credentials) {
         // item back, and retry once on mismatch.
         for _ in 0..<2 {
             if runSecurity(["-i"], stdin: keychainWriteCommand(json)) != nil,
-               readKeychainString() == json { return }
+               readKeychainString() == json { return true }
         }
+        return false
     }
 }
 
@@ -416,46 +487,59 @@ func requestUsage(token: String, completion: @escaping (Result<Usage, Error>) ->
     }.resume()
 }
 
-func fetchUsage(completion: @escaping (Result<Usage, Error>) -> Void) {
-    DispatchQueue.global(qos: .utility).async {
-        guard let stored = readCredentials(), let storedToken = stored.accessToken else {
-            DispatchQueue.main.async { completion(.failure(FetchError.noToken)) }
+/// The credentials to poll with. A pending unsaved refresh is retried first;
+/// until it lands, its in-memory tokens are the live ones. `fetchQueue` only.
+private func pollCredentials() -> Credentials? {
+    guard let p = unsavedRefresh else { return readCredentials() }
+    let result = commitRefresh(p.fields, spent: p.spent, snapshot: p.creds)
+    if case .refreshed = result { unsavedRefresh = nil }
+    return result.credentials
+}
+
+/// Completes on the main queue. The flag is true while rotated tokens are
+/// still waiting to be written back (see `unsavedRefresh`).
+func fetchUsage(completion: @escaping (Result<Usage, Error>, _ unsaved: Bool) -> Void) {
+    fetchQueue.async {
+        guard var creds = pollCredentials(), var token = creds.accessToken else {
+            DispatchQueue.main.async { completion(.failure(FetchError.noToken), false) }
             return
         }
-        var creds = stored
-        var token = storedToken
         // Proactive refresh: renew ahead of `expiresAt` so most polls never
         // see a 401 at all. A failed refresh is not fatal here — the request
         // below still runs with the stored token and reports as usual.
         if credentialsNeedRefresh(creds),
-           let fresh = refreshCredentials(creds), let t = fresh.accessToken {
+           let fresh = refreshCredentials(creds).credentials, let t = fresh.accessToken {
             creds = fresh
             token = t
         }
+        let unsaved = unsavedRefresh != nil
         requestUsage(token: token) { result in
             // Reactive retry, once: a 401/403 despite a plausible `expiresAt`
             // means the token went stale some other way. `refreshCredentials`
             // rate-gates itself, so this cannot loop.
             if case .failure(let err) = result, let fe = err as? FetchError,
                case .http(let code) = fe, code == 401 || code == 403 {
-                DispatchQueue.global(qos: .utility).async {
-                    guard let fresh = refreshCredentials(creds),
+                fetchQueue.async {
+                    guard let fresh = refreshCredentials(creds).credentials,
                           let t = fresh.accessToken else {
-                        DispatchQueue.main.async { completion(result) }
+                        let unsaved = unsavedRefresh != nil
+                        DispatchQueue.main.async { completion(result, unsaved) }
                         return
                     }
-                    requestUsage(token: t, completion: completion)
+                    let unsaved = unsavedRefresh != nil
+                    requestUsage(token: t) { completion($0, unsaved) }
                 }
                 return
             }
-            completion(result)
+            completion(result, unsaved)
         }
     }
 }
 
 func fetchProfile(completion: @escaping (String?) -> Void) {
-    DispatchQueue.global(qos: .utility).async {
-        guard let token = readCredentials()?.accessToken else {
+    fetchQueue.async {
+        // While a rotation is unsaved the stored access token is stale.
+        guard let token = (unsavedRefresh?.creds ?? readCredentials())?.accessToken else {
             DispatchQueue.main.async { completion(nil) }
             return
         }
@@ -516,6 +600,17 @@ final class PulsingDot: NSView {
         anim.repeatCount = .infinity
         dot.add(anim, forKey: "pulse")
         toolTip = "Waiting for data…"
+    }
+
+    /// A quick scale blip acknowledging a click (e.g. ↻), so the button
+    /// never feels dead even when the request itself has to wait.
+    func flash() {
+        let a = CABasicAnimation(keyPath: "transform.scale")
+        a.fromValue = 1.0
+        a.toValue = 1.8
+        a.duration = 0.15
+        a.autoreverses = true
+        dot.add(a, forKey: "flash")
     }
 
     required init?(coder: NSCoder) { fatalError("unused") }
@@ -642,6 +737,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var rateLimitedUntil: Date?
     var lastFetchStarted: Date?
     var isFetching = false
+    /// Bumped per fetch; a completion from a superseded fetch (one whose guard
+    /// was released as stuck) is dropped instead of clobbering newer state.
+    var fetchGeneration = 0
     /// A fetch still "in flight" after this long is assumed dead (a wedged
     /// helper process, a socket that never completed) and the guard is
     /// released so polling can resume.
@@ -921,17 +1019,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .joined(separator: " · ")
     }
 
-    @objc func refreshClicked() { refresh(manual: true) }
+    @objc func refreshClicked() {
+        liveDot.flash()
+        refresh(manual: true)
+    }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func loginToggled(_ sender: NSButton) { setStartAtLogin(sender.state == .on) }
 
-    func scheduleNextPoll(after delay: TimeInterval) {
+    func scheduleNextPoll(after delay: TimeInterval, manual: Bool = false) {
         timer?.invalidate()
         // Only ever later than asked, so a cool-off is never cut short, and two
         // instances (or restarts) don't line up on the same second.
         let jittered = max(delay, 1) * Double.random(in: 1.0...1.15)
         let t = Timer.scheduledTimer(withTimeInterval: jittered, repeats: false) {
-            [weak self] _ in self?.refresh()
+            [weak self] _ in self?.refresh(manual: manual)
         }
         // Harmless slack: the delay is already jittered and only ever grows.
         t.tolerance = min(jittered * 0.1, 30)
@@ -944,15 +1045,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// restart it. Deliberately generous — this must never poll faster than
     /// the normal schedule, and refresh() still applies every guard.
     func watchdogTick() {
-        if isFetching, let started = lastFetchStarted,
-           -started.timeIntervalSinceNow > stuckFetchTimeout {
-            // Presumed dead; release the guard so the chain can move again.
-            isFetching = false
+        if releaseStuckFetch() {
+            // The dropped fetch can no longer reschedule; keep the chain alive.
+            scheduleNextPoll(after: pollInterval)
         }
         if isFetching { return }
         if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 { return }
         let idle = lastFetchStarted.map { -$0.timeIntervalSinceNow } ?? .greatestFiniteMagnitude
         if idle > maxPoll + 5 * 60 { refresh() }
+    }
+
+    /// A fetch "in flight" for minutes never called back (e.g. a Keychain read
+    /// blocked on an unanswered prompt): release the guard so polling can
+    /// resume. Bumping the generation drops the old fetch's late completion,
+    /// and `fetchQueue` being serial keeps it from overlapping the next one.
+    @discardableResult
+    func releaseStuckFetch() -> Bool {
+        guard isFetching, let started = lastFetchStarted,
+              -started.timeIntervalSinceNow > stuckFetchTimeout else { return false }
+        isFetching = false
+        fetchGeneration += 1
+        return true
     }
 
     /// Problems are shown as a dot color + tooltip only; the panel keeps the
@@ -966,17 +1079,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Sends at most one request at a time, never before `nextFetchAllowed`,
     /// and never at all while the server's 429 cool-off is still running.
     func refresh(manual: Bool = false) {
-        if isFetching {
-            // A fetch that has been "in flight" for minutes never called back
-            // (e.g. a Keychain read that blocked on an unanswered prompt).
-            // Drop the guard so this attempt can proceed; otherwise the
-            // in-flight one will reschedule when it completes.
-            guard let started = lastFetchStarted,
-                  -started.timeIntervalSinceNow > stuckFetchTimeout else { return }
-            isFetching = false
-        }
+        // Otherwise the in-flight fetch reschedules when it completes.
+        releaseStuckFetch()
+        if isFetching { return }
         if let started = lastFetchStarted, -started.timeIntervalSinceNow < minFetchGap {
-            scheduleNextPoll(after: minFetchGap)
+            // Debounce, but keep a click's intent: a manual refresh still
+            // happens as soon as the gap is up.
+            if manual {
+                scheduleNextPoll(after: minFetchGap + started.timeIntervalSinceNow,
+                                 manual: true)
+            } else {
+                scheduleNextPoll(after: minFetchGap)
+            }
             return
         }
         if let until = rateLimitedUntil, until.timeIntervalSinceNow > 0 {
@@ -992,8 +1106,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         isFetching = true
         lastFetchStarted = Date()
-        fetchUsage { [weak self] result in
-            guard let self = self else { return }
+        fetchGeneration += 1
+        let generation = fetchGeneration
+        fetchUsage { [weak self] result, unsaved in
+            guard let self = self, generation == self.fetchGeneration else { return }
             self.isFetching = false
             switch result {
             case .success(let usage):
@@ -1007,7 +1123,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastSuccess = Date()
                 self.pollInterval = basePoll
                 self.rateLimitedUntil = nil
-                self.setStatus(.systemGreen, "Live")
+                if unsaved {
+                    // Numbers are fresh, but Claude Code's stored sign-in is
+                    // stale until the pending write lands (retried each poll).
+                    self.setStatus(.systemYellow, "Couldn't save renewed sign-in — retrying")
+                } else {
+                    self.setStatus(.systemGreen, "Live")
+                }
                 self.updateFooter()
                 // The launch-time profile fetch fails when the app starts with
                 // an expired token; backfill the user line after the token

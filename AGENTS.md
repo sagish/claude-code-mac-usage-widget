@@ -56,6 +56,17 @@ update it there, don't restate it here.
 - Credential write-back after a refresh must keep tokens out of process argument
   lists: the Keychain write goes through `security -i` with the command fed via
   stdin — never pass the JSON as a CLI argument.
+- Why `/usr/bin/security` and not `SecItemCopyMatching`/`SecItemUpdate`: the
+  item is Claude Code's, created through `security`, so that Apple-signed tool
+  is what its ACL trusts. An in-process call from this unsigned, ad-hoc-built
+  binary would hit a Keychain prompt, and "Always Allow" is keyed to code
+  identity, which changes on every rebuild (and Claude Code recreates the item
+  on sign-in). The CLI's quirks are handled in code instead: the 4096-byte
+  `security -i` line limit (size guard), hex-encoded `-w` output, and
+  read-back verification of every write.
+- Never let a refresh rotate tokens that can't be kept: the token exchange is
+  awaited to completion, the write merges into the store's current JSON, and an
+  unsaved rotation stays in memory and is retried (see SPEC.md, Credentials).
 - Do not add analytics, crash reporting, or any third-party network calls.
 
 ## PR / commit guidelines

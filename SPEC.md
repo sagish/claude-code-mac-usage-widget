@@ -25,15 +25,34 @@ token only in the grant below; neither is logged or shown.
 When the access token is expired or within 60 s of `expiresAt`, the widget
 renews it before polling: `POST https://console.anthropic.com/v1/oauth/token`,
 body `{grant_type: refresh_token, refresh_token, client_id}`, client ID
-`9d1c250a-e61b-44d9-88ed-5944d1962f5e`, 15 s timeout.
+`9d1c250a-e61b-44d9-88ed-5944d1962f5e`. The exchange is capped at 30 s by
+URLSession itself (15 s idle) and the widget always waits for its outcome:
+abandoning a response the server has already answered would lose a rotation.
+
+All credential reads, refreshes and writes run on one serial queue, so two
+fetches never touch the Keychain item at the same time.
 
 - On success `accessToken`, `refreshToken` (rotated; the old one kept only if
-  the response omits a new one) and `expiresAt` (now + `expires_in`) merge into
-  the JSON, other fields preserved, and are written back to the store they came
-  from, never the other; rotation invalidates the old refresh token, so this
-  write is mandatory. Keychain write-back uses `security -i` with the command on
-  stdin, keeping the JSON out of any argument list, under the same deadline as
-  the read; file write-back is atomic, `0600`.
+  the response omits a new one) and `expiresAt` (now + `expires_in`) are
+  written back to the store they came from, never the other; rotation
+  invalidates the old refresh token, so this write is mandatory. The store is
+  re-read right before writing and only those three fields are merged into its
+  *current* JSON, so changes Claude Code made meanwhile (e.g. MCP OAuth
+  entries) survive. If the stored refresh token is no longer the one the widget
+  spent, Claude Code refreshed or signed in on its own: its credentials win and
+  nothing is written.
+- If the write fails, the rotated tokens are kept in memory and used for
+  polling, and the write is retried at the start of every poll until it lands
+  (or Claude Code's own newer credentials appear). Meanwhile a successful poll
+  shows the dot yellow, "Couldn't save renewed sign-in — retrying", instead of
+  green. Quitting the widget in this state drops the only live tokens, so
+  Claude Code would need a fresh sign-in. A write only ever goes over a store
+  that was just read back: if the item is missing (signed out meanwhile) or
+  unreadable, it is never re-created from memory. The profile fetch also uses
+  the in-memory tokens while a write is pending.
+- Keychain write-back uses `security -i` with the command on stdin, keeping the
+  JSON out of any argument list, under the same deadline as the read; file
+  write-back is atomic, `0600`.
 - A Keychain write counts only if `security -i` exits 0 and the item reads back
   identical; otherwise it is retried once.
 - Size guard: `security -i` reads each stdin line into a 4096-byte buffer and
@@ -100,8 +119,9 @@ The live dot pulses continuously (opacity 1.0 ↔ 0.2, 0.9 s autoreverse) and is
 the only place a problem surfaces — color and tooltip, never panel text:
 
 - gray "Waiting for data…" before the first poll; green "Live" after a success.
-- yellow, retrying by itself: "Paused — Claude asked to slow down" (429) or
-  "Can't reach Claude — retrying" (offline, 5xx, unparseable body).
+- yellow, retrying by itself: "Paused — Claude asked to slow down" (429),
+  "Can't reach Claude — retrying" (offline, 5xx, unparseable body), or
+  "Couldn't save renewed sign-in — retrying" (see Credentials).
 - red, needs the user: "Not signed in — run `claude` to sign in" or "Sign-in
   expired — open Claude Code".
 
@@ -133,15 +153,19 @@ polled too often.
 - Poll on launch, then rescheduled after every attempt (one-shot timer, never a
   fixed repeating beat): 5 min after a success, longer after a failure, plus
   0–15 % jitter that never shortens a cool-off.
-- One request in flight at a time. Manual refresh (↻ or Refresh now) skips the
-  remaining wait but is debounced to one request per 30 s.
+- One request in flight at a time. Manual refresh (↻ or Refresh now) blips the
+  live dot to acknowledge the click and skips the remaining wait, debounced to
+  one request per 30 s: a click inside that gap still fires once it is up.
 - HTTP 429: the delay is the server's `Retry-After` (seconds or HTTP date)
   clamped to 5–30 min, else the backoff below; until it elapses nothing is sent
   at all, manual refreshes included. Any other failure doubles the delay
   (5 → 10 → 20 → 30 min, capped); success resets it to 5 min.
 - On `NSWorkspace.didWakeNotification` the backoff resets to 5 min and a poll
   runs ~5 s later, still through every guard (a 429 cool-off blocks it).
-- The in-flight guard is released once a fetch has been in flight over 2 min.
+- The in-flight guard is released once a fetch has been in flight over 2 min;
+  that fetch's late result is then discarded (per-fetch generation counter),
+  the next poll is scheduled at the normal interval in its place, and the
+  serial credential queue keeps it from overlapping the next one.
   The 30 s footer timer doubles as a watchdog, calling `refresh()` — through
   every guard, never faster than normal — if nothing has been *attempted* for
   longer than `maxPoll` + 5 min with no 429 cool-off running.
