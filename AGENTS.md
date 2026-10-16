@@ -12,7 +12,8 @@ update it there, don't restate it here.
 - Needs only Xcode Command Line Tools (`swiftc`); no package manager and no
   `Package.swift` — don't introduce one for small changes.
 - `./start` rebuilds only when `ClaudeUsageWidget.swift` is newer than the
-  binary, stops any running instance, then launches detached. `./start --force`
+  binary (with `-warnings-as-errors`, enforcing the zero-warnings rule), stops
+  any running instance, then launches detached. `./start --force`
   always rebuilds; `./start --stop` just stops it.
 - Directly: `swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift` then
   `./ClaudeUsageWidget &` (background it; GUI app, no Dock icon). Always stop

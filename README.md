@@ -52,7 +52,8 @@ you open Claude Code). Tokens never leave your machine except to Anthropic.
 - ↻ or right-click → **Refresh now**; right-click → **Quit** to close.
 - Bars turn orange at 70% and red at 90%. Hover a row for the exact reset time.
 - Floater in the way? Tick **Menu bar** (bottom-right) to tuck the widget into
-  the menu bar as `S 42% · W 18% · F 9%` (session, weekly, Fable). Click it to
+  the menu bar as `S 42% · W 18% · M 9%` (session, weekly, model-scoped weekly,
+  e.g. Fable). Click it to
   drop the full panel down, right-click for Refresh / move back / Quit. Untick,
   or right-click → **Move back to floating widget**, to float again at the
   remembered spot.

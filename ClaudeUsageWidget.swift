@@ -693,7 +693,9 @@ func setStartAtLogin(_ enabled: Bool) {
     } else {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        p.arguments = ["unload", agentPlistURL.path]
+        // `unload` is deprecated; `bootout` by label is its modern equivalent
+        // (best-effort — the agent is usually not loaded, see above).
+        p.arguments = ["bootout", "gui/\(getuid())/com.empathy.claude-usage-widget"]
         try? p.run()
         p.waitUntilExit()
         try? FileManager.default.removeItem(at: agentPlistURL)
@@ -896,9 +898,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         effect.menu = buildMenu(withLeaveMenuBar: false)
 
-        // Restore last position, default to top-right corner
+        // Restore last position, default to top-right corner.
+        // `setFrameUsingName` reports whether a saved frame actually exists,
+        // so a widget dragged to the bottom-left corner (origin ≈ .zero) is
+        // not mistaken for "never positioned".
         panel.setFrameAutosaveName("ClaudeUsageWidget")
-        if panel.frame.origin == .zero, let screen = NSScreen.main {
+        if !panel.setFrameUsingName("ClaudeUsageWidget"), let screen = NSScreen.main {
             let vf = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: vf.maxX - width - 16, y: vf.maxY - height - 16))
         }
@@ -978,16 +983,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Status item shows Session, the all-models weekly and the model-scoped
-    /// weekly (e.g. Fable) as `S 42% · W 18% · F 9%` — each number tinted with
+    /// weekly (e.g. Fable) as `S 42% · W 18% · M 9%` — each number tinted with
     /// its bar's warning colors; the same three metrics, spelled out, go in
-    /// the tooltip.
+    /// the tooltip. Tags come from the limit kinds (session / weekly_all /
+    /// weekly_scoped), never from the model's display name: a model like
+    /// "Sonnet 5" would otherwise show "S" and collide with Session.
     func updateStatusTitle() {
         guard let btn = statusItem?.button else { return }
         let fableName = fableRow.name.stringValue
         let metrics: [(tag: String, name: String, m: Metric?)] = [
             ("S", "Session", lastUsage?.session),
             ("W", "All models", lastUsage?.weekly),
-            (String(fableName.prefix(1)), fableName, lastUsage?.fable),
+            ("M", fableName, lastUsage?.fable),
         ]
         guard metrics.contains(where: { $0.m != nil }) else {
             btn.title = "–"
@@ -1151,7 +1158,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case FetchError.http(let code) where code == 401 || code == 403:
                     self.setStatus(.systemRed, "Sign-in expired — open Claude Code")
                 case FetchError.rateLimited(let after):
-                    retry = min(max(after ?? retry, basePoll), self.maxPoll)
+                    // Only the floor is clamped: a server asking for longer
+                    // than `maxPoll` must be honoured, not retried early.
+                    retry = max(after ?? retry, basePoll)
                     self.rateLimitedUntil = Date().addingTimeInterval(retry)
                     self.setStatus(.systemYellow, "Paused — Claude asked to slow down")
                 default:
