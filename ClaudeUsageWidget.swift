@@ -5,7 +5,8 @@
 // claude.ai/settings/usage renders. When the access token has expired it
 // renews it itself with Claude Code's own OAuth refresh grant and writes the
 // rotated credentials back, so the widget stays live even when Claude Code
-// hasn't been opened in a while.
+// hasn't been opened in a while (unless the credentials item has grown too
+// large to write back safely — then renewal is left to Claude Code).
 //
 // Build:  swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift
 // Run:    ./ClaudeUsageWidget   (right-click the widget for Refresh / Quit)
@@ -107,14 +108,36 @@ private func runSecurity(_ args: [String], stdin: String? = nil) -> Data? {
     return out.fileHandleForReading.readDataToEndOfFile()
 }
 
+/// The raw Keychain value, or nil if missing, denied, or timed out.
+func readKeychainString() -> String? {
+    guard let data = runSecurity(["find-generic-password", "-s", keychainService, "-w"]),
+          let s = String(data: data, encoding: .utf8) else { return nil }
+    let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : decodeHexIfNeeded(trimmed)
+}
+
+/// `find-generic-password -w` prints the value hex-encoded when it contains
+/// any non-ASCII byte (e.g. a non-ASCII MCP server name in Claude Code's
+/// credentials). JSON always starts with `{`, so all-hex output is decoded.
+func decodeHexIfNeeded(_ s: String) -> String {
+    let hex = Array(s.utf8)
+    guard !hex.isEmpty, hex.count % 2 == 0 else { return s }
+    var out = [UInt8]()
+    out.reserveCapacity(hex.count / 2)
+    var i = 0
+    while i < hex.count {
+        guard let b = UInt8(String(decoding: hex[i..<i + 2], as: UTF8.self), radix: 16)
+        else { return s }
+        out.append(b)
+        i += 2
+    }
+    return String(bytes: out, encoding: .utf8) ?? s
+}
+
 func readCredentialsString() -> (raw: String, source: CredentialSource)? {
     // 1) macOS Keychain (default storage on Mac). On timeout or failure fall
     // through to the file rather than hanging the fetch.
-    if let data = runSecurity(["find-generic-password", "-s", keychainService, "-w"]),
-       let s = String(data: data, encoding: .utf8) {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return (trimmed, .keychain) }
-    }
+    if let s = readKeychainString() { return (s, .keychain) }
     // 2) Plain-file fallback
     if let d = try? Data(contentsOf: credentialsFileURL),
        let s = String(data: d, encoding: .utf8) {
@@ -151,6 +174,18 @@ private let refreshExpiryBuffer: TimeInterval = 60
 private var lastRefreshAttempt: Date?
 private let refreshAttemptGap: TimeInterval = 60
 
+/// `security -i` reads each stdin line into a fixed 4096-byte buffer: a
+/// longer line is stored truncated (the spilled tail is then parsed as a
+/// bogus command, so the exit status says nothing about the stored value),
+/// leaving cut-off JSON in the Keychain that signs Claude Code out. Claude
+/// Code keeps extra data (e.g. MCP OAuth tokens) in the same item, so the
+/// JSON can genuinely outgrow it. Commands are capped well below that.
+private let keychainCommandLimit = 4000
+/// Room for refreshed tokens/expiry being longer than the current ones when
+/// deciding up front whether a refresh could be persisted. Tokens are ~100
+/// bytes and are replaced, not appended, so this is generous.
+private let keychainRefreshHeadroom = 256
+
 func credentialsNeedRefresh(_ c: Credentials) -> Bool {
     guard let ms = c.expiresAtMs else { return false }
     return Date().timeIntervalSince1970 >= ms / 1000 - refreshExpiryBuffer
@@ -166,6 +201,11 @@ func refreshCredentials(_ creds: Credentials) -> Credentials? {
         return nil
     }
     guard let refreshToken = creds.refreshToken, !refreshToken.isEmpty else { return nil }
+    // The endpoint rotates the refresh token, so a refresh that can't be
+    // written back would invalidate the stored one and sign Claude Code out.
+    // Leave the refresh to Claude Code instead (the poll then reports
+    // "Sign-in expired — open Claude Code").
+    guard canPersist(creds, headroom: keychainRefreshHeadroom) else { return nil }
     lastRefreshAttempt = Date()
 
     var req = URLRequest(url: oauthTokenURL)
@@ -210,28 +250,53 @@ func refreshCredentials(_ creds: Credentials) -> Credentials? {
     return updated
 }
 
+func credentialsJSON(_ creds: Credentials) -> String? {
+    guard let data = try? JSONSerialization.data(
+        withJSONObject: creds.root, options: [.sortedKeys, .withoutEscapingSlashes])
+    else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+/// The `security -i` stdin line that stores `json` in the Keychain. Escapes
+/// cover the JSON's own quotes and backslashes.
+func keychainWriteCommand(_ json: String) -> String {
+    let escaped = json
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+    return "add-generic-password -U -a \"\(NSUserName())\" "
+        + "-s \"\(keychainService)\" -w \"\(escaped)\"\n"
+}
+
+/// Whether `creds` (grown by up to `headroom` bytes) could be written back to
+/// its store intact. Only the Keychain path has a size limit.
+func canPersist(_ creds: Credentials, headroom: Int = 0) -> Bool {
+    guard creds.source == .keychain else { return true }
+    guard let json = credentialsJSON(creds) else { return false }
+    return keychainWriteCommand(json).utf8.count + headroom <= keychainCommandLimit
+}
+
 /// Writes rotated credentials back to the same store they were read from. A
 /// refresh can invalidate the previous refresh token, so skipping this write
-/// would silently sign Claude Code out.
+/// would silently sign Claude Code out — but a truncated write is worse (it
+/// destroys the whole item), so an oversized Keychain write is never sent.
 func persistCredentials(_ creds: Credentials) {
-    guard let data = try? JSONSerialization.data(
-        withJSONObject: creds.root, options: [.sortedKeys, .withoutEscapingSlashes]),
-        let json = String(data: data, encoding: .utf8) else { return }
+    guard let json = credentialsJSON(creds) else { return }
     switch creds.source {
     case .file:
-        try? data.write(to: credentialsFileURL, options: .atomic)
+        try? Data(json.utf8).write(to: credentialsFileURL, options: .atomic)
         try? FileManager.default.setAttributes(
             [.posixPermissions: 0o600], ofItemAtPath: credentialsFileURL.path)
     case .keychain:
+        guard canPersist(creds) else { return }
         // `security -i` reads its command from stdin, so the token JSON never
-        // appears in the process argument list (visible to `ps`). Escapes
-        // cover the JSON's own quotes; token payloads are base64url.
-        let escaped = json
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let cmd = "add-generic-password -U -a \"\(NSUserName())\" "
-            + "-s \"\(keychainService)\" -w \"\(escaped)\"\n"
-        runSecurity(["-i"], stdin: cmd)
+        // appears in the process argument list (visible to `ps`). The refresh
+        // token has already rotated, so a failed write (locked Keychain, ACL
+        // denial, timeout) would sign Claude Code out: confirm by reading the
+        // item back, and retry once on mismatch.
+        for _ in 0..<2 {
+            if runSecurity(["-i"], stdin: keychainWriteCommand(json)) != nil,
+               readKeychainString() == json { return }
+        }
     }
 }
 

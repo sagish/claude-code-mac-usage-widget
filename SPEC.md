@@ -11,7 +11,8 @@ all-models weekly, and the model-scoped weekly limit (now "Fable").
    `/usr/bin/security find-generic-password -w`, with a 10 s deadline
    (then terminate, then `SIGKILL`, up to 14 s in all) so an unanswered Keychain
    prompt cannot block. On timeout, failure or a blank value, fall through to
-   (2).
+   (2). `-w` prints the value hex-encoded when it contains any non-ASCII byte,
+   so all-hex output is decoded before parsing.
 2. `~/.claude/.credentials.json`.
 
 Either yields JSON with the OAuth fields under `claudeAiOauth` (legacy: at the
@@ -33,10 +34,20 @@ body `{grant_type: refresh_token, refresh_token, client_id}`, client ID
   write is mandatory. Keychain write-back uses `security -i` with the command on
   stdin, keeping the JSON out of any argument list, under the same deadline as
   the read; file write-back is atomic, `0600`.
+- A Keychain write counts only if `security -i` exits 0 and the item reads back
+  identical; otherwise it is retried once.
+- Size guard: `security -i` reads each stdin line into a 4096-byte buffer and
+  stores longer lines truncated (the exit status doesn't reflect it), which
+  corrupts the item and signs Claude Code out. Claude Code keeps extra data
+  (e.g. MCP OAuth tokens) in the same item, so it can outgrow that. The write
+  command is capped at 4000 bytes; before refreshing, the widget checks the
+  current credentials plus 256 bytes of headroom would fit, and otherwise skips
+  the refresh (never rotating tokens it couldn't save), leaving renewal to
+  Claude Code.
 - A 401/403 from the usage endpoint triggers one reactive refresh and retry.
-- At most one attempt per 60 s. On failure the poll continues with the stale
-  token and the error path reports it (red dot, "Sign-in expired — open Claude
-  Code").
+- At most one attempt per 60 s. On failure (or a refresh skipped by the size
+  guard) the poll continues with the stale token and the error path reports it
+  (red dot, "Sign-in expired — open Claude Code").
 
 ## Endpoints
 

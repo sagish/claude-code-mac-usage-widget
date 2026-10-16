@@ -37,8 +37,9 @@ It reads your Claude Code OAuth token from the macOS Keychain (falling back to
 `~/.claude/.credentials.json`) and polls Anthropic's usage endpoint every
 5 minutes — slow on purpose, so it never trips the API's rate limit. An expired
 token is renewed with the same OAuth refresh grant Claude Code uses, so the
-widget keeps working after a long break. Tokens never leave your machine except
-to Anthropic.
+widget keeps working after a long break (unless Claude Code's stored
+credentials grow too large to write back safely — then the dot turns red until
+you open Claude Code). Tokens never leave your machine except to Anthropic.
 
 ## Usage
 
