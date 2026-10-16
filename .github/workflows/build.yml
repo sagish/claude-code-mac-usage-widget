@@ -1,0 +1,17 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swiftc --version
+      # Zero warnings is a project rule (AGENTS.md); enforced here rather than
+      # in ./start, so a newer Xcode's new deprecations can't stop users launching.
+      - run: swiftc -O -warnings-as-errors -o ClaudeUsageWidget ClaudeUsageWidget.swift
+      - run: swiftc -warnings-as-errors -o debug-usage debug-usage.swift
+      - run: swiftc -warnings-as-errors -o debug-profile debug-profile.swift
