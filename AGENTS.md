@@ -12,8 +12,7 @@ update it there, don't restate it here.
 - Needs only Xcode Command Line Tools (`swiftc`); no package manager and no
   `Package.swift` — don't introduce one for small changes.
 - `./start` rebuilds only when `ClaudeUsageWidget.swift` is newer than the
-  binary (with `-warnings-as-errors`, enforcing the zero-warnings rule), stops
-  any running instance, then launches detached. `./start --force`
+  binary, stops any running instance, then launches detached. `./start --force`
   always rebuilds; `./start --stop` just stops it.
 - Directly: `swiftc -O -o ClaudeUsageWidget ClaudeUsageWidget.swift` then
   `./ClaudeUsageWidget &` (background it; GUI app, no Dock icon). Always stop
@@ -21,7 +20,10 @@ update it there, don't restate it here.
   screen and double the API poll rate.
 - The compiled binary is gitignored — never commit it. `CLAUDE.md` is a symlink
   to this file; edit `AGENTS.md` only.
-- No test suite: verify by building (zero warnings) and running it.
+- No test suite: verify by building (zero warnings) and running it. CI
+  (`.github/workflows/build.yml`) builds the widget and both debug scripts on
+  macOS with `-warnings-as-errors`; `./start` deliberately doesn't, so a newer
+  Xcode's new warnings can't stop users launching the widget.
 - `swift debug-usage.swift` and `swift debug-profile.swift` print the raw
   `/api/oauth/usage` and `/api/oauth/profile` responses without the UI. Both need
   a signed-in Claude Code (Keychain item `Claude Code-credentials`, or

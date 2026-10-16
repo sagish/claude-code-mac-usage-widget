@@ -393,7 +393,8 @@ func parseDate(_ any: Any?) -> Date? {
 func retryAfter(_ http: HTTPURLResponse) -> TimeInterval? {
     guard let raw = http.value(forHTTPHeaderField: "Retry-After")?
         .trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
-    if let secs = Double(raw) { return max(secs, 0) }
+    // `Double` also parses "inf" and "nan"; neither is a usable delay.
+    if let secs = Double(raw) { return secs.isFinite ? max(secs, 0) : nil }
     let f = DateFormatter()
     f.locale = Locale(identifier: "en_US_POSIX")
     f.timeZone = TimeZone(identifier: "GMT")
@@ -691,13 +692,9 @@ func setStartAtLogin(_ enabled: Bool) {
         // Not loaded via launchctl here — that would spawn a second instance.
         // RunAtLoad picks it up at next login.
     } else {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        // `unload` is deprecated; `bootout` by label is its modern equivalent
-        // (best-effort — the agent is usually not loaded, see above).
-        p.arguments = ["bootout", "gui/\(getuid())/com.empathy.claude-usage-widget"]
-        try? p.run()
-        p.waitUntilExit()
+        // Not unloaded/booted out either: when this instance was started at
+        // login it *is* the agent's process, and launchd would kill it. Without
+        // the plist nothing starts at next login.
         try? FileManager.default.removeItem(at: agentPlistURL)
     }
 }
@@ -733,6 +730,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // on a fixed beat: successes go back to `basePoll`, failures double the
     // delay up to `maxPoll`, and a 429 honours Retry-After.
     let maxPoll: TimeInterval = 30 * 60
+    /// Upper bound on a 429's `Retry-After` (see refresh()).
+    let maxRetryAfter: TimeInterval = 24 * 60 * 60
     let minFetchGap: TimeInterval = 30 // debounces the ↻ button
     var pollInterval: TimeInterval = basePoll
     var nextFetchAllowed = Date.distantPast
@@ -1158,9 +1157,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 case FetchError.http(let code) where code == 401 || code == 403:
                     self.setStatus(.systemRed, "Sign-in expired — open Claude Code")
                 case FetchError.rateLimited(let after):
-                    // Only the floor is clamped: a server asking for longer
-                    // than `maxPoll` must be honoured, not retried early.
-                    retry = max(after ?? retry, basePoll)
+                    // Honoured beyond `maxPoll` rather than retried early, but
+                    // bounded: nothing recovers a cool-off short of a restart,
+                    // so one bogus header must not stop polling for good.
+                    retry = min(max(after ?? retry, basePoll), self.maxRetryAfter)
                     self.rateLimitedUntil = Date().addingTimeInterval(retry)
                     self.setStatus(.systemYellow, "Paused — Claude asked to slow down")
                 default:

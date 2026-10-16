@@ -35,8 +35,7 @@ fi
 
 if [ "$force" -eq 1 ] || [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
   echo "building ${BIN}…"
-  # -warnings-as-errors enforces the zero-warnings rule from AGENTS.md
-  swiftc -O -warnings-as-errors -o "$BIN" "$SRC"
+  swiftc -O -o "$BIN" "$SRC"
 fi
 
 stop

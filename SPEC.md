@@ -134,9 +134,9 @@ over windows; state persists in `UserDefaults` key `InMenuBar`, applied on
 launch.
 
 - **On**: the panel hides and an `NSStatusItem` appears — sparkle symbol plus
-  `S <session>% · W <weekly>% · M <model-scoped>%` (tags come from the limit
-  kinds — session / weekly_all / weekly_scoped — never from the model name, so
-  a model like "Sonnet 5" can't collide with Session's "S") in monospaced
+  `S <session>% · W <weekly>% · M <model-scoped>%` (fixed tags, one per
+  limit kind — session / weekly_all / weekly_scoped — never derived from the
+  model name, so a model like "Sonnet 5" can't collide with Session's "S") in monospaced
   digits, each percentage orange at ≥ 70 % and red at ≥ 90 %, "–" where a
   metric is missing. Before any data the title is "–" with tooltip
   `Claude usage — waiting for data`; otherwise
@@ -158,11 +158,13 @@ polled too often.
 - One request in flight at a time. Manual refresh (↻ or Refresh now) blips the
   live dot to acknowledge the click and skips the remaining wait, debounced to
   one request per 30 s: a click inside that gap still fires once it is up.
-- HTTP 429: the delay is the server's `Retry-After` (seconds or HTTP date)
-  clamped only at the floor to 5 min — a server asking for longer than 30 min
-  is honoured, not retried early — else the backoff below; until it elapses
-  nothing is sent at all, manual refreshes included. Any other failure doubles
-  the delay (5 → 10 → 20 → 30 min, capped); success resets it to 5 min.
+- HTTP 429: the delay is the server's `Retry-After` (seconds or HTTP date),
+  else the backoff below, clamped to 5 min–24 h. A wait longer than the 30 min
+  backoff cap is honoured, not retried early; the 24 h ceiling (and ignoring a
+  non-finite value) keeps one bogus header from stopping polling until a
+  restart. Until it elapses nothing is sent at all, manual refreshes included.
+  Any other failure doubles the delay (5 → 10 → 20 → 30 min, capped); success
+  resets it to 5 min.
 - On `NSWorkspace.didWakeNotification` the backoff resets to 5 min and a poll
   runs ~5 s later, still through every guard (a 429 cool-off blocks it).
 - The in-flight guard is released once a fetch has been in flight over 2 min;
@@ -184,9 +186,9 @@ Checkbox state on launch = existence of
 `~/Library/LaunchAgents/com.empathy.claude-usage-widget.plist`. Ticking it writes
 that plist with `RunAtLoad = true` and `ProgramArguments` set to the binary's
 absolute path, deliberately without `launchctl load` (that would spawn a second
-instance), so it applies at next login. Unticking runs `launchctl bootout` on
-the agent's label (best-effort; `unload` is deprecated), then deletes the
-plist.
+instance), so it applies at next login. Unticking only deletes the plist,
+symmetrically without `launchctl unload`/`bootout`: if this instance was
+started at login it is the agent's process, and launchd would kill it.
 
 ## Non-goals
 
