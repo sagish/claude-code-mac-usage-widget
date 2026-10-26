@@ -47,8 +47,10 @@ you open Claude Code). Tokens never leave your machine except to Anthropic.
 
 - Drag anywhere; position is remembered. Visible on all Spaces, no Dock icon.
 - Pulsing dot: green = up to date, yellow = temporary hiccup (it retries on its
-  own), red = you need to sign in again. Hover for the detail and the last
-  update time; errors never replace the numbers on the panel.
+  own, and never replaces the numbers on the panel). Hover for the detail and
+  the last update time. If your sign-in expires, the footer says so in red
+  ("Sign-in expired — open Claude Code, then ↻") and the numbers dim until the
+  next successful fetch; in menu bar mode the status item reads "Sign in".
 - ↻ or right-click → **Refresh now**; right-click → **Quit** to close.
 - Bars turn orange at 70% and red at 90%. Hover a row for the exact reset time.
 - Floater in the way? Tick **Menu bar** (bottom-right) to tuck the widget into

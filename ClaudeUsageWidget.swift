@@ -228,7 +228,7 @@ func credentialsNeedRefresh(_ c: Credentials) -> Bool {
 /// Exchanges the stored refresh token for a fresh access token and persists
 /// the result back to the store it came from. Synchronous — `fetchQueue`
 /// only. On `.failed` callers proceed with the stale token and the normal
-/// error path (red dot) reports the outcome.
+/// error path (red dot, footer message) reports the outcome.
 func refreshCredentials(_ creds: Credentials) -> RefreshResult {
     if let last = lastRefreshAttempt, -last.timeIntervalSinceNow < refreshAttemptGap {
         return .failed
@@ -237,7 +237,7 @@ func refreshCredentials(_ creds: Credentials) -> RefreshResult {
     // The endpoint rotates the refresh token, so a refresh that can't be
     // written back would invalidate the stored one and sign Claude Code out.
     // Leave the refresh to Claude Code instead (the poll then reports
-    // "Sign-in expired — open Claude Code").
+    // "Sign-in expired — open Claude Code, then ↻").
     guard canPersist(creds, headroom: keychainRefreshHeadroom) else { return .failed }
     lastRefreshAttempt = Date()
 
@@ -716,6 +716,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var sessionResetsAt: Date?
     var lastSuccess: Date?
     var sawFailure = false
+    /// Set while the user has to act (no credentials, or a sign-in the widget
+    /// could not renew). Unlike transient failures this is written into the
+    /// footer and the rows are dimmed, so stale numbers are not mistaken for
+    /// live ones; cleared by the next successful fetch.
+    var actionNeeded: String?
+    let weeklyHeader = NSTextField(labelWithString: "WEEKLY")
 
     // Menu bar mode: the panel is hidden and a compact status item shows the
     // highest utilization; clicking it drops the full panel down under it.
@@ -859,7 +865,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         place(sessionRow, y: height - 64)
 
-        let weeklyHeader = NSTextField(labelWithString: "WEEKLY")
         weeklyHeader.font = .systemFont(ofSize: 8.5, weight: .semibold)
         weeklyHeader.textColor = .tertiaryLabelColor
         weeklyHeader.frame = NSRect(x: pad, y: height - 86, width: 100, height: 11)
@@ -989,6 +994,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// "Sonnet 5" would otherwise show "S" and collide with Session.
     func updateStatusTitle() {
         guard let btn = statusItem?.button else { return }
+        if let message = actionNeeded {
+            // Plain label color on purpose: status items are monochrome, and
+            // the text already says it; the tooltip carries the full message.
+            btn.title = "Sign in"
+            btn.toolTip = "Claude usage — \(message)"
+            return
+        }
         let fableName = fableRow.name.stringValue
         let metrics: [(tag: String, name: String, m: Metric?)] = [
             ("S", "Session", lastUsage?.session),
@@ -1082,6 +1094,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         liveDot.toolTip = "\(tip) · updated \(formatTime(last, "h:mm a"))"
     }
 
+    /// Enters (message) or leaves (nil) the "user must act" state. Credentials
+    /// are re-read every poll, so once the user signs in again the next poll
+    /// clears this by itself; ↻ gets there sooner. Only these red states are
+    /// ever written into the panel — transient failures stay dot-only.
+    func setActionNeeded(_ message: String?) {
+        actionNeeded = message
+        let alpha: CGFloat = message == nil ? 1 : 0.55
+        for row in [sessionRow, weeklyRow, fableRow] {
+            row.name.alphaValue = alpha
+            row.bar.alphaValue = alpha
+            row.pct.alphaValue = alpha
+        }
+        weeklyHeader.alphaValue = alpha
+        footer.textColor = message == nil ? .tertiaryLabelColor : .systemRed
+        if let message = message { setStatus(.systemRed, message) }
+        updateFooter()
+        updateStatusTitle()
+    }
+
     /// Sends at most one request at a time, never before `nextFetchAllowed`,
     /// and never at all while the server's 429 cool-off is still running.
     func refresh(manual: Bool = false) {
@@ -1129,6 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastSuccess = Date()
                 self.pollInterval = basePoll
                 self.rateLimitedUntil = nil
+                self.setActionNeeded(nil)
                 if unsaved {
                     // Numbers are fresh, but Claude Code's stored sign-in is
                     // stale until the pending write lands (retried each poll).
@@ -1145,17 +1177,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.loadProfile()
                 }
             case .failure(let err):
-                // Nothing is written into the panel on failure: the rows and
+                // Transient failures never write to the panel: the rows and
                 // footer keep the last known values and only the dot changes.
+                // The two red states do (see setActionNeeded).
                 self.sawFailure = true
                 // Every failure at least doubles the delay; a 429 prefers the
                 // server's Retry-After when it sends one.
                 var retry = min(self.pollInterval * 2, self.maxPoll)
                 switch err {
                 case FetchError.noToken:
-                    self.setStatus(.systemRed, "Not signed in — run `claude` to sign in")
+                    self.setActionNeeded("Not signed in — open Claude Code, then ↻")
+                    retry = basePoll
                 case FetchError.http(let code) where code == 401 || code == 403:
-                    self.setStatus(.systemRed, "Sign-in expired — open Claude Code")
+                    self.setActionNeeded("Sign-in expired — open Claude Code, then ↻")
+                    retry = basePoll
                 case FetchError.rateLimited(let after):
                     // Honoured beyond `maxPoll` rather than retried early, but
                     // bounded: nothing recovers a cool-off short of a restart,
@@ -1174,10 +1209,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The footer only ever describes data, never an error. "updated" is the
-    /// time of the last successful fetch, so stale numbers are never passed off
-    /// as fresh ones.
+    /// The footer describes data — "updated" is the time of the last
+    /// successful fetch, so stale numbers are never passed off as fresh ones —
+    /// except in the red states, where it carries the instruction instead
+    /// (the "updated" stamp moves to the dot's tooltip there).
     func updateFooter() {
+        if let message = actionNeeded { footer.stringValue = message; return }
         guard let last = lastSuccess else {
             if sawFailure { footer.stringValue = "no data yet" }
             return

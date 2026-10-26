@@ -66,7 +66,7 @@ fetches never touch the Keychain item at the same time.
 - A 401/403 from the usage endpoint triggers one reactive refresh and retry.
 - At most one attempt per 60 s. On failure (or a refresh skipped by the size
   guard) the poll continues with the stale token and the error path reports it
-  (red dot, "Sign-in expired — open Claude Code").
+  (red dot and footer, "Sign-in expired — open Claude Code, then ↻").
 
 ## Endpoints
 
@@ -107,25 +107,37 @@ Widget. Top to bottom:
 4. Footer `Session resets in X hr Y min · updated H:MM PM` — `X min` under an
    hour, `Session reset · updated H:MM PM` past it, plain `updated H:MM PM` with
    no known reset. "updated" is the last *successful* fetch, re-rendered every
-   30 s. Never an error: `loading…` before the first success, `no data yet`
-   after a failure.
+   30 s. `loading…` before the first success, `no data yet` after a failure.
+   The only errors it ever shows are the two red "needs action" states below,
+   where it carries that message in red instead of the stamp.
 5. **Start at login** checkbox (left), **Menu bar** checkbox (right).
 
 Rows are label, bar, integer percentage. Bar fill: blue below 70 %, orange at
 70–89 %, red at ≥ 90 %. A row with a known reset time gets the tooltip
 `Resets EEE h:mm a`; one with no data shows "–" and an empty bar.
 
-The live dot pulses continuously (opacity 1.0 ↔ 0.2, 0.9 s autoreverse) and is
-the only place a problem surfaces — color and tooltip, never panel text:
+The live dot pulses continuously (opacity 1.0 ↔ 0.2, 0.9 s autoreverse).
+Transient problems surface there only — color and tooltip, never panel text:
 
 - gray "Waiting for data…" before the first poll; green "Live" after a success.
 - yellow, retrying by itself: "Paused — Claude asked to slow down" (429),
   "Can't reach Claude — retrying" (offline, 5xx, unparseable body), or
   "Couldn't save renewed sign-in — retrying" (see Credentials).
-- red, needs the user: "Not signed in — run `claude` to sign in" or "Sign-in
-  expired — open Claude Code".
+- red, needs the user: "Not signed in — open Claude Code, then ↻" or "Sign-in
+  expired — open Claude Code, then ↻".
 
 After any successful fetch the tooltip appends `· updated H:MM PM`.
+
+The red states are the one exception to "never panel text": a tiny red dot
+reads as a broken widget, not as "sign in again". While one is active the
+footer shows that message in red (the "updated" stamp lives in the tooltip
+meanwhile), and the three rows plus the `WEEKLY` header are dimmed to 55 %
+opacity so the last numbers read as stale rather than current — they are not
+emptied, since weekly limits don't vanish with the token. The next successful
+fetch restores the footer, colors and opacity. "Open Claude Code" is the
+instruction in every red case: with a dead refresh token it prompts a sign-in,
+with a merely stale one it refreshes, and either way the widget re-reads the
+credentials on its next poll — ↻ gets there sooner.
 
 ## Menu bar mode
 
@@ -140,7 +152,9 @@ launch.
   digits, each percentage orange at ≥ 70 % and red at ≥ 90 %, "–" where a
   metric is missing. Before any data the title is "–" with tooltip
   `Claude usage — waiting for data`; otherwise
-  `Claude usage — Session 42% · All models 18% · Fable 9%`. Left-click toggles
+  `Claude usage — Session 42% · All models 18% · Fable 9%`. In a red state the
+  title is a plain, untinted `Sign in` (status items are monochrome; the
+  tooltip carries the full message). Left-click toggles
   the fully working panel, dropped under the status item and clamped to the
   screen edge. Right-click: Refresh now · Move back to floating widget · Quit.
 - **Off**: the status item goes away and the panel returns to its saved floating
@@ -163,8 +177,11 @@ polled too often.
   backoff cap is honoured, not retried early; the 24 h ceiling (and ignoring a
   non-finite value) keeps one bogus header from stopping polling until a
   restart. Until it elapses nothing is sent at all, manual refreshes included.
-  Any other failure doubles the delay (5 → 10 → 20 → 30 min, capped); success
-  resets it to 5 min.
+  Any other failure doubles the delay (5 → 10 → 20 → 30 min, capped), except
+  the two red states, which stay at 5 min: the backoff exists for a flaky
+  server, not for waiting on the user, and a new sign-in should be picked up
+  within one base poll (a poll with a dead token costs one request plus at most
+  one rate-gated refresh attempt). Success resets it to 5 min.
 - On `NSWorkspace.didWakeNotification` the backoff resets to 5 min and a poll
   runs ~5 s later, still through every guard (a 429 cool-off blocks it).
 - The in-flight guard is released once a fetch has been in flight over 2 min;
@@ -177,8 +194,9 @@ polled too often.
 - App Nap: a `beginActivity(.userInitiated)` assertion is held for the app's
   lifetime, or an accessory app with no window would have its one-shot timers
   deferred by minutes. Timer tolerances only ever delay a fire.
-- Failures never write to the panel: bars, percentages and footer keep the last
-  successfully fetched values; only the dot changes.
+- Transient failures never write to the panel: bars, percentages and footer
+  keep the last successfully fetched values; only the dot changes. The red
+  states additionally take over the footer and dim the rows (see Panel).
 
 ## Start at login
 

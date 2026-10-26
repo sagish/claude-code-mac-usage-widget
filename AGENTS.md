@@ -46,9 +46,12 @@ update it there, don't restate it here.
   Keep the single in-flight guard, the post-attempt rescheduling and the
   `Retry-After`/backoff handling in `refresh()` — never a fixed repeating poll
   timer, an unthrottled retry, or an interval below `basePoll` (5 min).
-- Never surface errors as panel text. On failure keep the last fetched values on
-  screen and signal state only through the live dot's color and tooltip
-  (`setStatus`): yellow = retrying by itself, red = the user must act.
+- Transient errors are never panel text. On failure keep the last fetched
+  values on screen and signal state through the live dot's color and tooltip
+  (`setStatus`): yellow = retrying by itself. The sole exception is red = the
+  user must act (`setActionNeeded`): the footer carries the instruction and the
+  rows dim, because a red dot alone reads as a broken widget. Don't add more
+  panel-text states, and don't grow the backoff in red states (SPEC, Polling).
 
 ## Security constraints
 
